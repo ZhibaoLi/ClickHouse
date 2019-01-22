@@ -2,11 +2,10 @@
 #include <IO/WriteBuffer.h>
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
-#include <IO/ReadBufferFromString.h>
-#include <IO/WriteBufferFromString.h>
 
 #include <Core/Field.h>
-#include <Core/FieldVisitors.h>
+#include <Core/DecimalComparison.h>
+#include <Common/FieldVisitors.h>
 
 
 namespace DB
@@ -34,6 +33,13 @@ namespace DB
                     x.push_back(value);
                     break;
                 }
+                case Field::Types::UInt128:
+                {
+                    UInt128 value;
+                    DB::readBinary(value, buf);
+                    x.push_back(value);
+                    break;
+                }
                 case Field::Types::Int64:
                 {
                     Int64 value;
@@ -69,7 +75,7 @@ namespace DB
                     x.push_back(value);
                     break;
                 }
-            };
+            }
         }
     }
 
@@ -92,6 +98,11 @@ namespace DB
                     DB::writeVarUInt(get<UInt64>(*it), buf);
                     break;
                 }
+                case Field::Types::UInt128:
+                {
+                    DB::writeBinary(get<UInt128>(*it), buf);
+                    break;
+                }
                 case Field::Types::Int64:
                 {
                     DB::writeVarInt(get<Int64>(*it), buf);
@@ -117,7 +128,7 @@ namespace DB
                     DB::writeBinary(get<Tuple>(*it), buf);
                     break;
                 }
-            };
+            }
         }
     }
 
@@ -133,7 +144,7 @@ namespace DB
 {
     inline void readBinary(Tuple & x_def, ReadBuffer & buf)
     {
-        auto & x = x_def.t;
+        auto & x = x_def.toUnderType();
         size_t size;
         DB::readBinary(size, buf);
 
@@ -153,6 +164,13 @@ namespace DB
                 {
                     UInt64 value;
                     DB::readVarUInt(value, buf);
+                    x.push_back(value);
+                    break;
+                }
+                case Field::Types::UInt128:
+                {
+                    UInt128 value;
+                    DB::readBinary(value, buf);
                     x.push_back(value);
                     break;
                 }
@@ -191,13 +209,13 @@ namespace DB
                     x.push_back(value);
                     break;
                 }
-            };
+            }
         }
     }
 
     void writeBinary(const Tuple & x_def, WriteBuffer & buf)
     {
-        auto & x = x_def.t;
+        auto & x = x_def.toUnderType();
         const size_t size = x.size();
         DB::writeBinary(size, buf);
 
@@ -212,6 +230,11 @@ namespace DB
                 case Field::Types::UInt64:
                 {
                     DB::writeVarUInt(get<UInt64>(*it), buf);
+                    break;
+                }
+                case Field::Types::UInt128:
+                {
+                    DB::writeBinary(get<UInt128>(*it), buf);
                     break;
                 }
                 case Field::Types::Int64:
@@ -239,7 +262,7 @@ namespace DB
                     DB::writeBinary(get<Tuple>(*it), buf);
                     break;
                 }
-            };
+            }
         }
     }
 
@@ -248,4 +271,53 @@ namespace DB
         DB::String res = applyVisitor(DB::FieldVisitorToString(), DB::Field(x));
         buf.write(res.data(), res.size());
     }
+
+
+    template <> Decimal32 DecimalField<Decimal32>::getScaleMultiplier() const
+    {
+        return DataTypeDecimal<Decimal32>::getScaleMultiplier(scale);
+    }
+
+    template <> Decimal64 DecimalField<Decimal64>::getScaleMultiplier() const
+    {
+        return DataTypeDecimal<Decimal64>::getScaleMultiplier(scale);
+    }
+
+    template <> Decimal128 DecimalField<Decimal128>::getScaleMultiplier() const
+    {
+        return DataTypeDecimal<Decimal128>::getScaleMultiplier(scale);
+    }
+
+    template <typename T>
+    static bool decEqual(T x, T y, UInt32 x_scale, UInt32 y_scale)
+    {
+        using Comparator = DecimalComparison<T, T, EqualsOp>;
+        return Comparator::compare(x, y, x_scale, y_scale);
+    }
+
+    template <typename T>
+    static bool decLess(T x, T y, UInt32 x_scale, UInt32 y_scale)
+    {
+        using Comparator = DecimalComparison<T, T, LessOp>;
+        return Comparator::compare(x, y, x_scale, y_scale);
+    }
+
+    template <typename T>
+    static bool decLessOrEqual(T x, T y, UInt32 x_scale, UInt32 y_scale)
+    {
+        using Comparator = DecimalComparison<T, T, LessOrEqualsOp>;
+        return Comparator::compare(x, y, x_scale, y_scale);
+    }
+
+    template <> bool decimalEqual(Decimal32 x, Decimal32 y, UInt32 xs, UInt32 ys) { return decEqual(x, y, xs, ys); }
+    template <> bool decimalLess(Decimal32 x, Decimal32 y, UInt32 xs, UInt32 ys) { return decLess(x, y, xs, ys); }
+    template <> bool decimalLessOrEqual(Decimal32 x, Decimal32 y, UInt32 xs, UInt32 ys) { return decLessOrEqual(x, y, xs, ys); }
+
+    template <> bool decimalEqual(Decimal64 x, Decimal64 y, UInt32 xs, UInt32 ys) { return decEqual(x, y, xs, ys); }
+    template <> bool decimalLess(Decimal64 x, Decimal64 y, UInt32 xs, UInt32 ys) { return decLess(x, y, xs, ys); }
+    template <> bool decimalLessOrEqual(Decimal64 x, Decimal64 y, UInt32 xs, UInt32 ys) { return decLessOrEqual(x, y, xs, ys); }
+
+    template <> bool decimalEqual(Decimal128 x, Decimal128 y, UInt32 xs, UInt32 ys) { return decEqual(x, y, xs, ys); }
+    template <> bool decimalLess(Decimal128 x, Decimal128 y, UInt32 xs, UInt32 ys) { return decLess(x, y, xs, ys); }
+    template <> bool decimalLessOrEqual(Decimal128 x, Decimal128 y, UInt32 xs, UInt32 ys) { return decLessOrEqual(x, y, xs, ys); }
 }

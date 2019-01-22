@@ -1,71 +1,20 @@
+#include <Common/TypeList.h>
+#include <Common/typeid_cast.h>
 #include <Interpreters/Aggregator.h>
-
 #include <AggregateFunctions/AggregateFunctionCount.h>
-#include <AggregateFunctions/AggregateFunctionSum.h>
-#include <AggregateFunctions/AggregateFunctionAvg.h>
-#include <AggregateFunctions/AggregateFunctionsMinMaxAny.h>
-#include <AggregateFunctions/AggregateFunctionsArgMinMax.h>
-#include <AggregateFunctions/AggregateFunctionUniq.h>
-#include <AggregateFunctions/AggregateFunctionUniqUpTo.h>
-#include <AggregateFunctions/AggregateFunctionGroupArray.h>
-#include <AggregateFunctions/AggregateFunctionGroupUniqArray.h>
-#include <AggregateFunctions/AggregateFunctionQuantile.h>
-#include <AggregateFunctions/AggregateFunctionQuantileTiming.h>
-#include <AggregateFunctions/AggregateFunctionIf.h>
-#include <AggregateFunctions/AggregateFunctionArray.h>
-#include <AggregateFunctions/AggregateFunctionState.h>
-#include <AggregateFunctions/AggregateFunctionMerge.h>
-#include <AggregateFunctions/AggregateFunctionNull.h>
 
 
 namespace DB
 {
 
 
-/** An aggregation cycle template that allows you to generate a custom variant for a specific combination of aggregate functions.
-  * It differs from the usual one in that calls to aggregate functions should be inlined, and the update cycle of the aggregate functions should be unfold.
+/** An aggregation loop template that allows you to generate a custom variant for a specific combination of aggregate functions.
+  * It differs from the usual one in that calls to aggregate functions should be inlined, and the update loop of the aggregate functions should be unrolled.
   *
   * Since there are too many possible combinations, it is not possible to generate them all in advance.
   * This template is intended to instantiate it in runtime,
   *  by running the compiler, compiling shared library, and using it with `dlopen`.
   */
-
-
-/** List of types - for convenient listing of aggregate functions.
-  */
-template <typename... TTail>
-struct TypeList
-{
-    static constexpr size_t size = 0;
-
-    template <size_t I>
-    using At = std::nullptr_t;
-
-    template <typename Func, size_t index = 0>
-    static void forEach(Func && func)
-    {
-    }
-};
-
-
-template <typename THead, typename... TTail>
-struct TypeList<THead, TTail...>
-{
-    using Head = THead;
-    using Tail = TypeList<TTail...>;
-
-    static constexpr size_t size = 1 + sizeof...(TTail);
-
-    template <size_t I>
-    using At = typename std::template conditional<I == 0, Head, typename Tail::template At<I - 1>>::type;
-
-    template <typename Func, size_t index = 0>
-    static void ALWAYS_INLINE forEach(Func && func)
-    {
-        func.template operator()<Head, index>();
-        Tail::template forEach<Func, index + 1>(std::forward<Func>(func));
-    }
-};
 
 
 struct AggregateFunctionsUpdater
@@ -100,7 +49,7 @@ void AggregateFunctionsUpdater::operator()()
 {
     static_cast<AggregateFunction *>(aggregate_functions[column_num])->add(
         value + offsets_of_aggregate_states[column_num],
-        &aggregate_columns[column_num][0],
+        aggregate_columns[column_num].data(),
         row_num, arena);
 }
 
@@ -109,7 +58,6 @@ struct AggregateFunctionsCreator
     AggregateFunctionsCreator(
         const Aggregator::AggregateFunctionsPlainPtrs & aggregate_functions_,
         const Sizes & offsets_of_aggregate_states_,
-        Aggregator::AggregateColumns & aggregate_columns_,
         AggregateDataPtr & aggregate_data_)
         : aggregate_functions(aggregate_functions_),
         offsets_of_aggregate_states(offsets_of_aggregate_states_),
@@ -153,22 +101,24 @@ void NO_INLINE Aggregator::executeSpecialized(
     Method & method,
     Arena * aggregates_pool,
     size_t rows,
-    ConstColumnPlainPtrs & key_columns,
+    ColumnRawPtrs & key_columns,
     AggregateColumns & aggregate_columns,
-    const Sizes & key_sizes,
     StringRefs & keys,
     bool no_more_keys,
     AggregateDataPtr overflow_row) const
 {
     typename Method::State state;
-    state.init(key_columns);
+    if constexpr (Method::low_cardinality_optimization)
+        state.init(key_columns, aggregation_state_cache);
+    else
+        state.init(key_columns);
 
     if (!no_more_keys)
         executeSpecializedCase<false, Method, AggregateFunctionsList>(
-            method, state, aggregates_pool, rows, key_columns, aggregate_columns, key_sizes, keys, overflow_row);
+            method, state, aggregates_pool, rows, key_columns, aggregate_columns, keys, overflow_row);
     else
         executeSpecializedCase<true, Method, AggregateFunctionsList>(
-            method, state, aggregates_pool, rows, key_columns, aggregate_columns, key_sizes, keys, overflow_row);
+            method, state, aggregates_pool, rows, key_columns, aggregate_columns, keys, overflow_row);
 }
 
 #pragma GCC diagnostic push
@@ -180,22 +130,25 @@ void NO_INLINE Aggregator::executeSpecializedCase(
     typename Method::State & state,
     Arena * aggregates_pool,
     size_t rows,
-    ConstColumnPlainPtrs & key_columns,
+    ColumnRawPtrs & key_columns,
     AggregateColumns & aggregate_columns,
-    const Sizes & key_sizes,
     StringRefs & keys,
     AggregateDataPtr overflow_row) const
 {
     /// For all rows.
-    typename Method::iterator it;
-    typename Method::Key prev_key;
+    typename Method::Key prev_key{};
+    AggregateDataPtr value = nullptr;
     for (size_t i = 0; i < rows; ++i)
     {
-        bool inserted;            /// Inserted a new key, or was this key already?
-        bool overflow = false;    /// New key did not fit in the hash table because of no_more_keys.
+        bool inserted = false;            /// Inserted a new key, or was this key already?
 
         /// Get the key to insert into the hash table.
-        typename Method::Key key = state.getKey(key_columns, params.keys_size, i, key_sizes, keys, *aggregates_pool);
+        typename Method::Key key;
+        if constexpr (!Method::low_cardinality_optimization)
+            key = state.getKey(key_columns, params.keys_size, i, key_sizes, keys, *aggregates_pool);
+
+        AggregateDataPtr * aggregate_data = nullptr;
+        typename Method::iterator it; /// Is not used if Method::low_cardinality_optimization
 
         if (!no_more_keys)    /// Insert.
         {
@@ -204,8 +157,6 @@ void NO_INLINE Aggregator::executeSpecializedCase(
             {
                 if (i != 0 && key == prev_key)
                 {
-                    AggregateDataPtr value = Method::getAggregateData(it->second);
-
                     /// Add values into aggregate functions.
                     AggregateFunctionsList::forEach(AggregateFunctionsUpdater(
                         aggregate_functions, offsets_of_aggregate_states, aggregate_columns, value, i, aggregates_pool));
@@ -217,19 +168,29 @@ void NO_INLINE Aggregator::executeSpecializedCase(
                     prev_key = key;
             }
 
-            method.data.emplace(key, it, inserted);
+            if constexpr (Method::low_cardinality_optimization)
+                aggregate_data = state.emplaceKeyFromRow(method.data, i, inserted, params.keys_size, keys, *aggregates_pool);
+            else
+            {
+                method.data.emplace(key, it, inserted);
+                aggregate_data = &Method::getAggregateData(it->second);
+            }
         }
         else
         {
             /// Add only if the key already exists.
-            inserted = false;
-            it = method.data.find(key);
-            if (method.data.end() == it)
-                overflow = true;
+            if constexpr (Method::low_cardinality_optimization)
+                aggregate_data = state.findFromRow(method.data, i);
+            else
+            {
+                it = method.data.find(key);
+                if (method.data.end() != it)
+                    aggregate_data = &Method::getAggregateData(it->second);
+            }
         }
 
         /// If the key does not fit, and the data does not need to be aggregated in a separate row, then there's nothing to do.
-        if (no_more_keys && overflow && !overflow_row)
+        if (!aggregate_data && !overflow_row)
         {
             method.onExistingKey(key, keys, *aggregates_pool);
             continue;
@@ -238,22 +199,25 @@ void NO_INLINE Aggregator::executeSpecializedCase(
         /// If a new key is inserted, initialize the states of the aggregate functions, and possibly some stuff related to the key.
         if (inserted)
         {
-            AggregateDataPtr & aggregate_data = Method::getAggregateData(it->second);
-            aggregate_data = nullptr;
+            *aggregate_data = nullptr;
 
-            method.onNewKey(*it, params.keys_size, i, keys, *aggregates_pool);
+            if constexpr (!Method::low_cardinality_optimization)
+                method.onNewKey(*it, params.keys_size, keys, *aggregates_pool);
 
-            AggregateDataPtr place = aggregates_pool->alloc(total_size_of_aggregate_states);
+            AggregateDataPtr place = aggregates_pool->alignedAlloc(total_size_of_aggregate_states, align_aggregate_states);
 
             AggregateFunctionsList::forEach(AggregateFunctionsCreator(
-                aggregate_functions, offsets_of_aggregate_states, aggregate_columns, place));
+                aggregate_functions, offsets_of_aggregate_states, place));
 
-            aggregate_data = place;
+            *aggregate_data = place;
+
+            if constexpr (Method::low_cardinality_optimization)
+                state.cacheAggregateData(i, place);
         }
         else
             method.onExistingKey(key, keys, *aggregates_pool);
 
-        AggregateDataPtr value = (!no_more_keys || !overflow) ? Method::getAggregateData(it->second) : overflow_row;
+        value = aggregate_data ? *aggregate_data : overflow_row;
 
         /// Add values into the aggregate functions.
         AggregateFunctionsList::forEach(AggregateFunctionsUpdater(
@@ -273,7 +237,7 @@ void NO_INLINE Aggregator::executeSpecializedWithoutKey(
     /// Optimization in the case of a single aggregate function `count`.
     AggregateFunctionCount * agg_count = params.aggregates_size == 1
         ? typeid_cast<AggregateFunctionCount *>(aggregate_functions[0])
-        : NULL;
+        : nullptr;
 
     if (agg_count)
         agg_count->addDelta(res, rows);
@@ -290,8 +254,8 @@ void NO_INLINE Aggregator::executeSpecializedWithoutKey(
 }
 
 
-/** The main code is compiled with gcc 5.
-  * But SpecializedAggregator is compiled using clang 3.6 into the .so file.
+/** The main code is compiled with gcc 7.
+  * But SpecializedAggregator is compiled using clang 6 into the .so file.
   * This is done because gcc can not get functions inlined,
   *  which were de-virtualized, in a particular case, and the performance is lower.
   * And also it's easier to distribute clang for deploy to the servers.
@@ -311,4 +275,4 @@ void NO_INLINE Aggregator::executeSpecializedWithoutKey(
   *
   * Therefore, we can work around the problem this way
   */
-extern "C" void __attribute__((__visibility__("default"), __noreturn__)) __cxa_pure_virtual() { abort(); };
+extern "C" void __attribute__((__visibility__("default"), __noreturn__)) __cxa_pure_virtual() { abort(); }

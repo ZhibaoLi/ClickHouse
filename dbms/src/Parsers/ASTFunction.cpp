@@ -1,6 +1,7 @@
 #include <Common/typeid_cast.h>
 #include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTFunction.h>
+#include <Parsers/ASTWithAlias.h>
 #include <IO/WriteHelpers.h>
 #include <IO/WriteBufferFromString.h>
 
@@ -8,40 +9,36 @@
 namespace DB
 {
 
-String ASTFunction::getColumnName() const
+void ASTFunction::appendColumnNameImpl(WriteBuffer & ostr) const
 {
-    String res;
-    WriteBufferFromString wb(res);
-    writeString(name, wb);
+    writeString(name, ostr);
 
     if (parameters)
     {
-        writeChar('(', wb);
-        for (ASTs::const_iterator it = parameters->children.begin(); it != parameters->children.end(); ++it)
+        writeChar('(', ostr);
+        for (auto it = parameters->children.begin(); it != parameters->children.end(); ++it)
         {
             if (it != parameters->children.begin())
-                writeCString(", ", wb);
-            writeString((*it)->getColumnName(), wb);
+                writeCString(", ", ostr);
+            (*it)->appendColumnName(ostr);
         }
-        writeChar(')', wb);
+        writeChar(')', ostr);
     }
 
-    writeChar('(', wb);
-    for (ASTs::const_iterator it = arguments->children.begin(); it != arguments->children.end(); ++it)
+    writeChar('(', ostr);
+    for (auto it = arguments->children.begin(); it != arguments->children.end(); ++it)
     {
         if (it != arguments->children.begin())
-            writeCString(", ", wb);
-        writeString((*it)->getColumnName(), wb);
+            writeCString(", ", ostr);
+        (*it)->appendColumnName(ostr);
     }
-    writeChar(')', wb);
-
-    return res;
+    writeChar(')', ostr);
 }
 
 /** Get the text that identifies this element. */
-String ASTFunction::getID() const
+String ASTFunction::getID(char delim) const
 {
-    return "Function_" + name;
+    return "Function" + (delim + name);
 }
 
 ASTPtr ASTFunction::clone() const
@@ -49,8 +46,8 @@ ASTPtr ASTFunction::clone() const
     auto res = std::make_shared<ASTFunction>(*this);
     res->children.clear();
 
-    if (arguments)     { res->arguments = arguments->clone();        res->children.push_back(res->arguments); }
-    if (parameters) { res->parameters = parameters->clone();     res->children.push_back(res->parameters); }
+    if (arguments) { res->arguments = arguments->clone(); res->children.push_back(res->arguments); }
+    if (parameters) { res->parameters = parameters->clone(); res->children.push_back(res->parameters); }
 
     return res;
 }
@@ -66,27 +63,6 @@ void ASTFunction::formatImplWithoutAlias(const FormatSettings & settings, Format
     bool written = false;
     if (arguments && !parameters)
     {
-        if (0 == strcmp(name.data(), "CAST"))
-        {
-            settings.ostr << (settings.hilite ? hilite_keyword : "") << name;
-
-            settings.ostr << '(' << (settings.hilite ? hilite_none : "");
-
-            arguments->children.front()->formatImpl(settings, state, nested_need_parens);
-
-            settings.ostr <<  (settings.hilite ? hilite_keyword : "") << " AS "
-                << (settings.hilite ? hilite_none : "");
-
-            settings.ostr << (settings.hilite ? hilite_function : "")
-                << typeid_cast<const ASTLiteral &>(*arguments->children.back()).value.safeGet<String>()
-                << (settings.hilite ? hilite_none : "");
-
-            settings.ostr << (settings.hilite ? hilite_keyword : "") << ')'
-                << (settings.hilite ? hilite_none : "");
-
-            written = true;
-        }
-
         if (arguments->children.size() == 1)
         {
             const char * operators[] =
@@ -124,23 +100,23 @@ void ASTFunction::formatImplWithoutAlias(const FormatSettings & settings, Format
         {
             const char * operators[] =
             {
-                "multiply",            " * ",
-                "divide",            " / ",
-                "modulo",            " % ",
-                "plus",             " + ",
-                "minus",             " - ",
-                "notEquals",        " != ",
-                "lessOrEquals",        " <= ",
-                "greaterOrEquals",    " >= ",
-                "less",                " < ",
-                "greater",            " > ",
-                "equals",            " = ",
-                "like",                " LIKE ",
-                "notLike",            " NOT LIKE ",
-                "in",                " IN ",
-                "notIn",            " NOT IN ",
-                "globalIn",            " GLOBAL IN ",
-                "globalNotIn",        " GLOBAL NOT IN ",
+                "multiply",        " * ",
+                "divide",          " / ",
+                "modulo",          " % ",
+                "plus",            " + ",
+                "minus",           " - ",
+                "notEquals",       " != ",
+                "lessOrEquals",    " <= ",
+                "greaterOrEquals", " >= ",
+                "less",            " < ",
+                "greater",         " > ",
+                "equals",          " = ",
+                "like",            " LIKE ",
+                "notLike",         " NOT LIKE ",
+                "in",              " IN ",
+                "notIn",           " NOT IN ",
+                "globalIn",        " GLOBAL IN ",
+                "globalNotIn",     " GLOBAL NOT IN ",
                 nullptr
             };
 
@@ -170,10 +146,17 @@ void ASTFunction::formatImplWithoutAlias(const FormatSettings & settings, Format
 
             if (!written && 0 == strcmp(name.c_str(), "tupleElement"))
             {
-                arguments->children[0]->formatImpl(settings, state, nested_need_parens);
-                settings.ostr << (settings.hilite ? hilite_operator : "") << "." << (settings.hilite ? hilite_none : "");
-                arguments->children[1]->formatImpl(settings, state, nested_need_parens);
-                written = true;
+                /// It can be printed in a form of 'x.1' only if right hand side is unsigned integer literal.
+                if (const ASTLiteral * lit = typeid_cast<const ASTLiteral *>(arguments->children[1].get()))
+                {
+                    if (lit->value.getType() == Field::Types::UInt64)
+                    {
+                        arguments->children[0]->formatImpl(settings, state, nested_need_parens);
+                        settings.ostr << (settings.hilite ? hilite_operator : "") << "." << (settings.hilite ? hilite_none : "");
+                        arguments->children[1]->formatImpl(settings, state, nested_need_parens);
+                        written = true;
+                    }
+                }
             }
 
             if (!written && 0 == strcmp(name.c_str(), "lambda"))
@@ -206,8 +189,8 @@ void ASTFunction::formatImplWithoutAlias(const FormatSettings & settings, Format
         {
             const char * operators[] =
             {
-                "and",                " AND ",
-                "or",                " OR ",
+                "and", " AND ",
+                "or", " OR ",
                 nullptr
             };
 
@@ -230,7 +213,7 @@ void ASTFunction::formatImplWithoutAlias(const FormatSettings & settings, Format
             }
         }
 
-        if (!written && arguments->children.size() >= 1 && 0 == strcmp(name.c_str(), "array"))
+        if (!written && 0 == strcmp(name.c_str(), "array"))
         {
             settings.ostr << (settings.hilite ? hilite_operator : "") << '[' << (settings.hilite ? hilite_none : "");
             for (size_t i = 0; i < arguments->children.size(); ++i)

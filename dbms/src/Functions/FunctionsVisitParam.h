@@ -9,10 +9,10 @@
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnArray.h>
 #include <Columns/ColumnFixedString.h>
-#include <Columns/ColumnConst.h>
 #include <Common/hex.h>
 #include <Common/Volnitsky.h>
 #include <Functions/IFunction.h>
+#include <Functions/FunctionHelpers.h>
 #include <IO/ReadBufferFromMemory.h>
 #include <IO/ReadHelpers.h>
 
@@ -43,13 +43,13 @@ struct HasParam
 {
     using ResultType = UInt8;
 
-    static UInt8 extract(const UInt8 * begin, const UInt8 * end)
+    static UInt8 extract(const UInt8 *, const UInt8 *)
     {
         return true;
     }
 };
 
-template<typename NumericType>
+template <typename NumericType>
 struct ExtractNumericType
 {
     using ResultType = NumericType;
@@ -64,7 +64,12 @@ struct ExtractNumericType
 
         ResultType x = 0;
         if (!in.eof())
-            readText(x, in);
+        {
+            if constexpr (std::is_floating_point_v<NumericType>)
+                tryReadFloatText(x, in);
+            else
+                tryReadIntText(x, in);
+        }
         return x;
     }
 };
@@ -82,163 +87,61 @@ struct ExtractBool
 
 struct ExtractRaw
 {
-    static void extract(const UInt8 * pos, const UInt8 * end, ColumnString::Chars_t & res_data)
+    static constexpr size_t bytes_on_stack = 64;
+    using ExpectChars = PODArray<char, bytes_on_stack, AllocatorWithStackMemory<Allocator<false>, bytes_on_stack>>;
+
+    static void extract(const UInt8 * pos, const UInt8 * end, ColumnString::Chars & res_data)
     {
-        if (pos == end)
-            return;
+        ExpectChars expects_end;
+        UInt8 current_expect_end = 0;
 
-        UInt8 open_char = *pos;
-        UInt8 close_char = 0;
-        switch (open_char)
+        for (auto extract_begin = pos; pos != end; ++pos)
         {
-            case '[':
-                close_char = ']';
-                break;
-            case '{':
-                close_char = '}';
-                break;
-            case '"':
-                close_char = '"';
-                break;
-        }
-
-        if (close_char != 0)
-        {
-            size_t balance = 1;
-            char last_char = 0;
-
-            res_data.push_back(*pos);
-
-            ++pos;
-            for (; pos != end && balance > 0; ++pos)
+            if (*pos == current_expect_end)
             {
-                res_data.push_back(*pos);
-
-                if (open_char == '"' && *pos == '"')
-                {
-                    if (last_char != '\\')
-                        break;
-                }
-                else
-                {
-                    if (*pos == open_char)
-                        ++balance;
-                    if (*pos == close_char)
-                        --balance;
-                }
-
-                if (last_char == '\\')
-                    last_char = 0;
-                else
-                    last_char = *pos;
+                expects_end.pop_back();
+                current_expect_end = expects_end.empty() ? 0 : expects_end.back();
             }
-        }
-        else
-        {
-            for (; pos != end && *pos != ',' && *pos != '}'; ++pos)
-                res_data.push_back(*pos);
+            else
+            {
+                switch (*pos)
+                {
+                    case '[':
+                        current_expect_end = ']';
+                        expects_end.push_back(current_expect_end);
+                        break;
+                    case '{':
+                        current_expect_end = '}';
+                        expects_end.push_back(current_expect_end);
+                        break;
+                    case '"' :
+                        current_expect_end = '"';
+                        expects_end.push_back(current_expect_end);
+                        break;
+                    case '\\':
+                        /// skip backslash
+                        if (pos + 1 < end && pos[1] == '"')
+                            pos++;
+                        break;
+                    default:
+                        if (!current_expect_end && (*pos == ',' || *pos == '}'))
+                        {
+                            res_data.insert(extract_begin, pos);
+                            return;
+                        }
+                }
+            }
         }
     }
 };
 
 struct ExtractString
 {
-    static UInt64 unhexCodePoint(const UInt8 * pos)
-    {
-        return unhex(pos[0]) * 0xFFF
-             + unhex(pos[1]) * 0xFF
-             + unhex(pos[2]) * 0xF
-             + unhex(pos[3]);
-    }
-
-    static bool tryExtract(const UInt8 * pos, const UInt8 * end, ColumnString::Chars_t & res_data)
-    {
-        if (pos == end || *pos != '"')
-            return false;
-
-        ++pos;
-        while (pos != end)
-        {
-            switch (*pos)
-            {
-                case '\\':
-                    ++pos;
-                    if (pos >= end)
-                        return false;
-
-                    switch(*pos)
-                    {
-                        case '"':
-                            res_data.push_back('"');
-                            break;
-                        case '\\':
-                            res_data.push_back('\\');
-                            break;
-                        case '/':
-                            res_data.push_back('/');
-                            break;
-                        case 'b':
-                            res_data.push_back('\b');
-                            break;
-                        case 'f':
-                            res_data.push_back('\f');
-                            break;
-                        case 'n':
-                            res_data.push_back('\n');
-                            break;
-                        case 'r':
-                            res_data.push_back('\r');
-                            break;
-                        case 't':
-                            res_data.push_back('\t');
-                            break;
-                        case 'u':
-                        {
-                            ++pos;
-
-                            if (pos + 4 > end)
-                                return false;
-
-                            UInt16 code_point = unhexCodePoint(pos);
-                            pos += 3;
-
-                            static constexpr size_t max_code_point_byte_length = 4;
-
-                            size_t old_size = res_data.size();
-                            res_data.resize(old_size + max_code_point_byte_length);
-
-                            Poco::UTF8Encoding utf8;
-                            int length = utf8.convert(code_point,
-                                &res_data[old_size], max_code_point_byte_length);
-
-                            if (!length)
-                                return false;
-
-                            res_data.resize(old_size + length);
-                            break;
-                        }
-                        default:
-                            res_data.push_back(*pos);
-                            break;
-                    }
-                    ++pos;
-                    break;
-                case '"':
-                    return true;
-                default:
-                    res_data.push_back(*pos);
-                    ++pos;
-                    break;
-            }
-        }
-        return false;
-    }
-
-    static void extract(const UInt8 * pos, const UInt8 * end, ColumnString::Chars_t & res_data)
+    static void extract(const UInt8 * pos, const UInt8 * end, ColumnString::Chars & res_data)
     {
         size_t old_size = res_data.size();
-
-        if (!tryExtract(pos, end, res_data))
+        ReadBufferFromMemory in(pos, end - pos);
+        if (!tryReadJSONStringInto(res_data, in))
             res_data.resize(old_size);
     }
 };
@@ -258,14 +161,14 @@ struct ExtractParamImpl
     using ResultType = typename ParamExtractor::ResultType;
 
     /// It is assumed that `res` is the correct size and initialized with zeros.
-    static void vector_constant(const ColumnString::Chars_t & data, const ColumnString::Offsets_t & offsets,
+    static void vector_constant(const ColumnString::Chars & data, const ColumnString::Offsets & offsets,
         std::string needle,
         PaddedPODArray<ResultType> & res)
     {
         /// We are looking for a parameter simply as a substring of the form "name"
         needle = "\"" + needle + "\":";
 
-        const UInt8 * begin = &data[0];
+        const UInt8 * begin = data.data();
         const UInt8 * pos = begin;
         const UInt8 * end = pos + data.size();
 
@@ -294,7 +197,8 @@ struct ExtractParamImpl
             ++i;
         }
 
-        memset(&res[i], 0, (res.size() - i) * sizeof(res[0]));
+        if (res.size() > i)
+            memset(&res[i], 0, (res.size() - i) * sizeof(res[0]));
     }
 
     static void constant_constant(const std::string & data, std::string needle, ResultType & res)
@@ -310,18 +214,12 @@ struct ExtractParamImpl
             );
     }
 
-    static void vector_vector(
-        const ColumnString::Chars_t & haystack_data, const ColumnString::Offsets_t & haystack_offsets,
-        const ColumnString::Chars_t & needle_data, const ColumnString::Offsets_t & needle_offsets,
-        PaddedPODArray<ResultType> & res)
+    template <typename... Args> static void vector_vector(Args &&...)
     {
         throw Exception("Functions 'visitParamHas' and 'visitParamExtract*' doesn't support non-constant needle argument", ErrorCodes::ILLEGAL_COLUMN);
     }
 
-    static void constant_vector(
-        const String & haystack,
-        const ColumnString::Chars_t & needle_data, const ColumnString::Offsets_t & needle_offsets,
-        PaddedPODArray<ResultType> & res)
+    template <typename... Args> static void constant_vector(Args &&...)
     {
         throw Exception("Functions 'visitParamHas' and 'visitParamExtract*' doesn't support non-constant needle argument", ErrorCodes::ILLEGAL_COLUMN);
     }
@@ -330,21 +228,21 @@ struct ExtractParamImpl
 
 /** For the case where the type of field to extract is a string.
  */
-template<typename ParamExtractor>
+template <typename ParamExtractor>
 struct ExtractParamToStringImpl
 {
-    static void vector(const ColumnString::Chars_t & data, const ColumnString::Offsets_t & offsets,
+    static void vector(const ColumnString::Chars & data, const ColumnString::Offsets & offsets,
                        std::string needle,
-                       ColumnString::Chars_t & res_data, ColumnString::Offsets_t & res_offsets)
+                       ColumnString::Chars & res_data, ColumnString::Offsets & res_offsets)
     {
         /// Constant 5 is taken from a function that performs a similar task FunctionsStringSearch.h::ExtractImpl
-        res_data.reserve(data.size()  / 5);
+        res_data.reserve(data.size() / 5);
         res_offsets.resize(offsets.size());
 
         /// We are looking for a parameter simply as a substring of the form "name"
         needle = "\"" + needle + "\":";
 
-        const UInt8 * begin = &data[0];
+        const UInt8 * begin = data.data();
         const UInt8 * pos = begin;
         const UInt8 * end = pos + data.size();
 

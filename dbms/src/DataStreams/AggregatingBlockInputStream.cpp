@@ -14,6 +14,11 @@ namespace ProfileEvents
 namespace DB
 {
 
+Block AggregatingBlockInputStream::getHeader() const
+{
+    return aggregator.getHeader(final);
+}
+
 
 Block AggregatingBlockInputStream::readImpl()
 {
@@ -42,10 +47,9 @@ Block AggregatingBlockInputStream::readImpl()
 
             if (!isCancelled())
             {
-                /// Flush data in the RAM to disk also. It's easier.
-                size_t rows = data_variants->sizeWithoutOverflowRow();
-                if (rows)
-                    aggregator.writeToTemporaryFile(*data_variants, rows);
+                /// Flush data in the RAM to disk also. It's easier than merging on-disk and RAM data.
+                if (data_variants->size())
+                    aggregator.writeToTemporaryFile(*data_variants);
             }
 
             const auto & files = aggregator.getTemporaryFiles();
@@ -64,16 +68,15 @@ Block AggregatingBlockInputStream::readImpl()
         }
     }
 
-    Block res;
-    if (isCancelled() || !impl)
-        return res;
+    if (isCancelledOrThrowIfKilled() || !impl)
+        return {};
 
     return impl->read();
 }
 
 
 AggregatingBlockInputStream::TemporaryFileStream::TemporaryFileStream(const std::string & path)
-    : file_in(path), compressed_in(file_in), block_in(std::make_shared<NativeBlockInputStream>(compressed_in, ClickHouseRevision::get())) {}
-
+    : file_in(path), compressed_in(file_in),
+    block_in(std::make_shared<NativeBlockInputStream>(compressed_in, ClickHouseRevision::get())) {}
 
 }

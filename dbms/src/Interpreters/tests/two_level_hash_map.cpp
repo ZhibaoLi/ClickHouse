@@ -14,7 +14,7 @@
 
 #include <Core/Types.h>
 #include <IO/ReadBufferFromFile.h>
-#include <IO/CompressedReadBuffer.h>
+#include <Compression/CompressedReadBuffer.h>
 #include <Common/HashTable/TwoLevelHashTable.h>
 #include <Common/HashTable/HashMap.h>
 
@@ -25,6 +25,12 @@ using Value = UInt64;
 
 int main(int argc, char ** argv)
 {
+    if (argc < 2)
+    {
+        std::cerr << "Usage: program n\n";
+        return 1;
+    }
+
     size_t n = atoi(argv[1]);
 
     std::vector<Key> data(n);
@@ -36,7 +42,7 @@ int main(int argc, char ** argv)
         DB::ReadBufferFromFileDescriptor in1(STDIN_FILENO);
         DB::CompressedReadBuffer in2(in1);
 
-        in2.readStrict(reinterpret_cast<char*>(&data[0]), sizeof(data[0]) * n);
+        in2.readStrict(reinterpret_cast<char*>(data.data()), sizeof(data[0]) * n);
 
         watch.stop();
         std::cerr << std::fixed << std::setprecision(2)
@@ -49,9 +55,9 @@ int main(int argc, char ** argv)
     {
         Stopwatch watch;
 
-        std::cerr << sizeof(HashMapCell<Key, Value, DefaultHash<Key> >) << std::endl;
+        std::cerr << sizeof(HashMapCell<Key, Value, DefaultHash<Key>>) << std::endl;
 
-        using Map = TwoLevelHashTable<Key, HashMapCell<Key, Value, DefaultHash<Key> >, DefaultHash<Key>, HashTableGrower<8>, HashTableAllocator>;
+        using Map = TwoLevelHashTable<Key, HashMapCell<Key, Value, DefaultHash<Key>>, DefaultHash<Key>, HashTableGrower<8>, HashTableAllocator>;
 
         Map map;
         Map::iterator it;
@@ -86,7 +92,7 @@ int main(int argc, char ** argv)
     {
         Stopwatch watch;
 
-        using Map = TwoLevelHashTable<Key, HashMapCell<Key, Value, DefaultHash<Key> >, DefaultHash<Key>, HashTableGrower<8>, HashTableAllocator>;
+        using Map = TwoLevelHashTable<Key, HashMapCell<Key, Value, DefaultHash<Key>>, DefaultHash<Key>, HashTableGrower<8>, HashTableAllocator>;
         //using Map = HashMap<Key, Value, UniquesHashSetDefaultHash>;
 
         Map map;

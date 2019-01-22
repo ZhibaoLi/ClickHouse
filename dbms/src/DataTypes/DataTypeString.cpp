@@ -4,13 +4,17 @@
 #include <Columns/ColumnsNumber.h>
 #include <Columns/ColumnConst.h>
 
+#include <Common/typeid_cast.h>
+
+#include <Formats/FormatSettings.h>
 #include <DataTypes/DataTypeString.h>
+#include <DataTypes/DataTypeFactory.h>
 
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
 #include <IO/VarInt.h>
 
-#if __SSE2__
+#ifdef __SSE2__
     #include <emmintrin.h>
 #endif
 
@@ -34,7 +38,7 @@ void DataTypeString::deserializeBinary(Field & field, ReadBuffer & istr) const
     field = String();
     String & s = get<String &>(field);
     s.resize(size);
-    istr.readStrict(&s[0], size);
+    istr.readStrict(s.data(), size);
 }
 
 
@@ -49,8 +53,8 @@ void DataTypeString::serializeBinary(const IColumn & column, size_t row_num, Wri
 void DataTypeString::deserializeBinary(IColumn & column, ReadBuffer & istr) const
 {
     ColumnString & column_string = static_cast<ColumnString &>(column);
-    ColumnString::Chars_t & data = column_string.getChars();
-    ColumnString::Offsets_t & offsets = column_string.getOffsets();
+    ColumnString::Chars & data = column_string.getChars();
+    ColumnString::Offsets & offsets = column_string.getOffsets();
 
     UInt64 size;
     readVarUInt(size, istr);
@@ -77,8 +81,8 @@ void DataTypeString::deserializeBinary(IColumn & column, ReadBuffer & istr) cons
 void DataTypeString::serializeBinaryBulk(const IColumn & column, WriteBuffer & ostr, size_t offset, size_t limit) const
 {
     const ColumnString & column_string = typeid_cast<const ColumnString &>(column);
-    const ColumnString::Chars_t & data = column_string.getChars();
-    const ColumnString::Offsets_t & offsets = column_string.getOffsets();
+    const ColumnString::Chars & data = column_string.getChars();
+    const ColumnString::Offsets & offsets = column_string.getOffsets();
 
     size_t size = column.size();
     if (!size)
@@ -92,7 +96,7 @@ void DataTypeString::serializeBinaryBulk(const IColumn & column, WriteBuffer & o
     {
         UInt64 str_size = offsets[0] - 1;
         writeVarUInt(str_size, ostr);
-        ostr.write(reinterpret_cast<const char *>(&data[0]), str_size);
+        ostr.write(reinterpret_cast<const char *>(data.data()), str_size);
 
         ++offset;
     }
@@ -107,7 +111,7 @@ void DataTypeString::serializeBinaryBulk(const IColumn & column, WriteBuffer & o
 
 
 template <int UNROLL_TIMES>
-static NO_INLINE void deserializeBinarySSE2(ColumnString::Chars_t & data, ColumnString::Offsets_t & offsets, ReadBuffer & istr, size_t limit)
+static NO_INLINE void deserializeBinarySSE2(ColumnString::Chars & data, ColumnString::Offsets & offsets, ReadBuffer & istr, size_t limit)
 {
     size_t offset = data.size();
     for (size_t i = 0; i < limit; ++i)
@@ -125,9 +129,9 @@ static NO_INLINE void deserializeBinarySSE2(ColumnString::Chars_t & data, Column
 
         if (size)
         {
-#if __SSE2__
+#ifdef __SSE2__
             /// An optimistic branch in which more efficient copying is possible.
-            if (offset + 16 * UNROLL_TIMES <= data.allocated_size() && istr.position() + size + 16 * UNROLL_TIMES <= istr.buffer().end())
+            if (offset + 16 * UNROLL_TIMES <= data.allocated_bytes() && istr.position() + size + 16 * UNROLL_TIMES <= istr.buffer().end())
             {
                 const __m128i * sse_src_pos = reinterpret_cast<const __m128i *>(istr.position());
                 const __m128i * sse_src_end = sse_src_pos + (size + (16 * UNROLL_TIMES - 1)) / 16 / UNROLL_TIMES * UNROLL_TIMES;
@@ -135,8 +139,8 @@ static NO_INLINE void deserializeBinarySSE2(ColumnString::Chars_t & data, Column
 
                 while (sse_src_pos < sse_src_end)
                 {
-                    /// NOTE gcc 4.9.2 expands the loop, but for some reason uses only one xmm register.
-                    ///for (size_t j = 0; j < UNROLL_TIMES; ++j)
+                    /// NOTE gcc 4.9.2 unrolls the loop, but for some reason uses only one xmm register.
+                    /// for (size_t j = 0; j < UNROLL_TIMES; ++j)
                     ///    _mm_storeu_si128(sse_dst_pos + j, _mm_loadu_si128(sse_src_pos + j));
 
                     sse_src_pos += UNROLL_TIMES;
@@ -170,10 +174,10 @@ static NO_INLINE void deserializeBinarySSE2(ColumnString::Chars_t & data, Column
 void DataTypeString::deserializeBinaryBulk(IColumn & column, ReadBuffer & istr, size_t limit, double avg_value_size_hint) const
 {
     ColumnString & column_string = typeid_cast<ColumnString &>(column);
-    ColumnString::Chars_t & data = column_string.getChars();
-    ColumnString::Offsets_t & offsets = column_string.getOffsets();
+    ColumnString::Chars & data = column_string.getChars();
+    ColumnString::Offsets & offsets = column_string.getOffsets();
 
-    double avg_chars_size;
+    double avg_chars_size = 1; /// By default reserve only for empty strings.
 
     if (avg_value_size_hint && avg_value_size_hint > sizeof(offsets[0]))
     {
@@ -182,21 +186,25 @@ void DataTypeString::deserializeBinaryBulk(IColumn & column, ReadBuffer & istr, 
 
         avg_chars_size = (avg_value_size_hint - sizeof(offsets[0])) * avg_value_size_hint_reserve_multiplier;
     }
-    else
-    {
-        /** A small heuristic to evaluate that there are a lot of empty strings in the column.
-          * In this case, to save RAM, we will say that the average size of the value is small.
-          */
-        if (istr.position() + sizeof(UInt32) <= istr.buffer().end()
-            && unalignedLoad<UInt32>(istr.position()) == 0)    /// The first 4 strings are in the buffer and are empty.
-        {
-            avg_chars_size = 1;
-        }
-        else
-            avg_chars_size = DBMS_APPROX_STRING_SIZE;
-    }
 
-    data.reserve(data.size() + std::ceil(limit * avg_chars_size));
+    size_t size_to_reserve = data.size() + std::ceil(limit * avg_chars_size);
+
+    /// Never reserve for too big size.
+    if (size_to_reserve < 256 * 1024 * 1024)
+    {
+        try
+        {
+            data.reserve(size_to_reserve);
+        }
+        catch (Exception & e)
+        {
+            e.addMessage(
+                "(avg_value_size_hint = " + toString(avg_value_size_hint)
+                + ", avg_chars_size = " + toString(avg_chars_size)
+                + ", limit = " + toString(limit) + ")");
+            throw;
+        }
+    }
 
     offsets.reserve(offsets.size() + limit);
 
@@ -211,24 +219,24 @@ void DataTypeString::deserializeBinaryBulk(IColumn & column, ReadBuffer & istr, 
 }
 
 
-void DataTypeString::serializeText(const IColumn & column, size_t row_num, WriteBuffer & ostr) const
+void DataTypeString::serializeText(const IColumn & column, size_t row_num, WriteBuffer & ostr, const FormatSettings &) const
 {
     writeString(static_cast<const ColumnString &>(column).getDataAt(row_num), ostr);
 }
 
 
-void DataTypeString::serializeTextEscaped(const IColumn & column, size_t row_num, WriteBuffer & ostr) const
+void DataTypeString::serializeTextEscaped(const IColumn & column, size_t row_num, WriteBuffer & ostr, const FormatSettings &) const
 {
     writeEscapedString(static_cast<const ColumnString &>(column).getDataAt(row_num), ostr);
 }
 
 
 template <typename Reader>
-static inline void read(IColumn & column, ReadBuffer & istr, Reader && reader)
+static inline void read(IColumn & column, Reader && reader)
 {
     ColumnString & column_string = static_cast<ColumnString &>(column);
-    ColumnString::Chars_t & data = column_string.getChars();
-    ColumnString::Offsets_t & offsets = column_string.getOffsets();
+    ColumnString::Chars & data = column_string.getChars();
+    ColumnString::Offsets & offsets = column_string.getOffsets();
 
     size_t old_chars_size = data.size();
     size_t old_offsets_size = offsets.size();
@@ -248,63 +256,84 @@ static inline void read(IColumn & column, ReadBuffer & istr, Reader && reader)
 }
 
 
-void DataTypeString::deserializeTextEscaped(IColumn & column, ReadBuffer & istr) const
+void DataTypeString::deserializeTextEscaped(IColumn & column, ReadBuffer & istr, const FormatSettings &) const
 {
-    read(column, istr, [&](ColumnString::Chars_t & data) { readEscapedStringInto(data, istr); });
+    read(column, [&](ColumnString::Chars & data) { readEscapedStringInto(data, istr); });
 }
 
 
-void DataTypeString::serializeTextQuoted(const IColumn & column, size_t row_num, WriteBuffer & ostr) const
+void DataTypeString::serializeTextQuoted(const IColumn & column, size_t row_num, WriteBuffer & ostr, const FormatSettings &) const
 {
     writeQuotedString(static_cast<const ColumnString &>(column).getDataAt(row_num), ostr);
 }
 
 
-void DataTypeString::deserializeTextQuoted(IColumn & column, ReadBuffer & istr) const
+void DataTypeString::deserializeTextQuoted(IColumn & column, ReadBuffer & istr, const FormatSettings &) const
 {
-    read(column, istr, [&](ColumnString::Chars_t & data) { readQuotedStringInto<true>(data, istr); });
+    read(column, [&](ColumnString::Chars & data) { readQuotedStringInto<true>(data, istr); });
 }
 
 
-void DataTypeString::serializeTextJSON(const IColumn & column, size_t row_num, WriteBuffer & ostr, bool) const
+void DataTypeString::serializeTextJSON(const IColumn & column, size_t row_num, WriteBuffer & ostr, const FormatSettings & settings) const
 {
-    writeJSONString(static_cast<const ColumnString &>(column).getDataAt(row_num), ostr);
+    writeJSONString(static_cast<const ColumnString &>(column).getDataAt(row_num), ostr, settings);
 }
 
 
-void DataTypeString::deserializeTextJSON(IColumn & column, ReadBuffer & istr) const
+void DataTypeString::deserializeTextJSON(IColumn & column, ReadBuffer & istr, const FormatSettings &) const
 {
-    read(column, istr, [&](ColumnString::Chars_t & data) { readJSONStringInto(data, istr); });
+    read(column, [&](ColumnString::Chars & data) { readJSONStringInto(data, istr); });
 }
 
 
-void DataTypeString::serializeTextXML(const IColumn & column, size_t row_num, WriteBuffer & ostr) const
+void DataTypeString::serializeTextXML(const IColumn & column, size_t row_num, WriteBuffer & ostr, const FormatSettings &) const
 {
     writeXMLString(static_cast<const ColumnString &>(column).getDataAt(row_num), ostr);
 }
 
 
-void DataTypeString::serializeTextCSV(const IColumn & column, size_t row_num, WriteBuffer & ostr) const
+void DataTypeString::serializeTextCSV(const IColumn & column, size_t row_num, WriteBuffer & ostr, const FormatSettings &) const
 {
     writeCSVString<>(static_cast<const ColumnString &>(column).getDataAt(row_num), ostr);
 }
 
 
-void DataTypeString::deserializeTextCSV(IColumn & column, ReadBuffer & istr, const char delimiter) const
+void DataTypeString::deserializeTextCSV(IColumn & column, ReadBuffer & istr, const FormatSettings & settings) const
 {
-    read(column, istr, [&](ColumnString::Chars_t & data) { readCSVStringInto(data, istr); });
+    read(column, [&](ColumnString::Chars & data) { readCSVStringInto(data, istr, settings.csv); });
 }
 
 
-ColumnPtr DataTypeString::createColumn() const
+MutableColumnPtr DataTypeString::createColumn() const
 {
-    return std::make_shared<ColumnString>();
+    return ColumnString::create();
 }
 
 
-ColumnPtr DataTypeString::createConstColumn(size_t size, const Field & field) const
+bool DataTypeString::equals(const IDataType & rhs) const
 {
-    return std::make_shared<ColumnConstString>(size, get<const String &>(field));
+    return typeid(rhs) == typeid(*this);
+}
+
+
+void registerDataTypeString(DataTypeFactory & factory)
+{
+    auto creator = static_cast<DataTypePtr(*)()>([] { return DataTypePtr(std::make_shared<DataTypeString>()); });
+
+    factory.registerSimpleDataType("String", creator);
+
+    /// These synonims are added for compatibility.
+
+    factory.registerAlias("CHAR", "String", DataTypeFactory::CaseInsensitive);
+    factory.registerAlias("VARCHAR", "String", DataTypeFactory::CaseInsensitive);
+    factory.registerAlias("TEXT", "String", DataTypeFactory::CaseInsensitive);
+    factory.registerAlias("TINYTEXT", "String", DataTypeFactory::CaseInsensitive);
+    factory.registerAlias("MEDIUMTEXT", "String", DataTypeFactory::CaseInsensitive);
+    factory.registerAlias("LONGTEXT", "String", DataTypeFactory::CaseInsensitive);
+    factory.registerAlias("BLOB", "String", DataTypeFactory::CaseInsensitive);
+    factory.registerAlias("TINYBLOB", "String", DataTypeFactory::CaseInsensitive);
+    factory.registerAlias("MEDIUMBLOB", "String", DataTypeFactory::CaseInsensitive);
+    factory.registerAlias("LONGBLOB", "String", DataTypeFactory::CaseInsensitive);
 }
 
 }

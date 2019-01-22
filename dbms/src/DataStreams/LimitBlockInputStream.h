@@ -17,16 +17,11 @@ public:
       * If always_read_till_end = true - reads all the data to the end, but ignores them. This is necessary in rare cases:
       *  when otherwise, due to the cancellation of the request, we would not have received the data for GROUP BY WITH TOTALS from the remote server.
       */
-    LimitBlockInputStream(BlockInputStreamPtr input_, size_t limit_, size_t offset_, bool always_read_till_end_ = false);
+    LimitBlockInputStream(const BlockInputStreamPtr & input, size_t limit_, size_t offset_, bool always_read_till_end_ = false);
 
     String getName() const override { return "Limit"; }
 
-    String getID() const override
-    {
-        std::stringstream res;
-        res << "Limit(" << children.back()->getID() << ", " << limit << ", " << offset << ")";
-        return res.str();
-    }
+    Block getHeader() const override { return children.at(0)->getHeader(); }
 
 protected:
     Block readImpl() override;

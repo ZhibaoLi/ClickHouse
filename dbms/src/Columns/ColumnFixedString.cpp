@@ -1,12 +1,15 @@
+#include <Columns/ColumnFixedString.h>
+#include <Columns/ColumnsCommon.h>
+
 #include <Common/Arena.h>
 #include <Common/SipHash.h>
 #include <Common/memcpySmall.h>
 
+#include <DataStreams/ColumnGathererStream.h>
+
 #include <IO/WriteHelpers.h>
 
-#include <Columns/ColumnFixedString.h>
-
-#if __SSE2__
+#ifdef __SSE2__
     #include <emmintrin.h>
 #endif
 
@@ -23,9 +26,9 @@ namespace ErrorCodes
 }
 
 
-ColumnPtr ColumnFixedString::cloneResized(size_t size) const
+MutableColumnPtr ColumnFixedString::cloneResized(size_t size) const
 {
-    ColumnPtr new_col_holder = std::make_shared<ColumnFixedString>(n);
+    MutableColumnPtr new_col_holder = ColumnFixedString::create(n);
 
     if (size > 0)
     {
@@ -33,7 +36,7 @@ ColumnPtr ColumnFixedString::cloneResized(size_t size) const
         new_col.chars.resize(size * n);
 
         size_t count = std::min(this->size(), size);
-        memcpy(&(new_col.chars[0]), &chars[0], count * n * sizeof(chars[0]));
+        memcpy(new_col.chars.data(), chars.data(), count * n * sizeof(chars[0]));
 
         if (size > count)
             memset(&(new_col.chars[count * n]), '\0', (size - count) * n);
@@ -100,7 +103,7 @@ template <bool positive>
 struct ColumnFixedString::less
 {
     const ColumnFixedString & parent;
-    less(const ColumnFixedString & parent_) : parent(parent_) {}
+    explicit less(const ColumnFixedString & parent_) : parent(parent_) {}
     bool operator()(size_t lhs, size_t rhs) const
     {
         /// TODO: memcmp slows down.
@@ -109,7 +112,7 @@ struct ColumnFixedString::less
     }
 };
 
-void ColumnFixedString::getPermutation(bool reverse, size_t limit, int nan_direction_hint, Permutation & res) const
+void ColumnFixedString::getPermutation(bool reverse, size_t limit, int /*nan_direction_hint*/, Permutation & res) const
 {
     size_t s = size();
     res.resize(s);
@@ -157,16 +160,16 @@ ColumnPtr ColumnFixedString::filter(const IColumn::Filter & filt, ssize_t result
     if (col_size != filt.size())
         throw Exception("Size of filter doesn't match size of column.", ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
 
-    std::shared_ptr<ColumnFixedString> res = std::make_shared<ColumnFixedString>(n);
+    auto res = ColumnFixedString::create(n);
 
     if (result_size_hint)
         res->chars.reserve(result_size_hint > 0 ? result_size_hint * n : chars.size());
 
-    const UInt8 * filt_pos = &filt[0];
+    const UInt8 * filt_pos = filt.data();
     const UInt8 * filt_end = filt_pos + col_size;
-    const UInt8 * data_pos = &chars[0];
+    const UInt8 * data_pos = chars.data();
 
-#if __SSE2__
+#ifdef __SSE2__
     /** A slightly more optimized version.
         * Based on the assumption that often pieces of consecutive values
         *  completely pass or do not pass the filter.
@@ -194,9 +197,9 @@ ColumnPtr ColumnFixedString::filter(const IColumn::Filter & filt, ssize_t result
         }
         else
         {
+            size_t res_chars_size = res->chars.size();
             for (size_t i = 0; i < SIMD_BYTES; ++i)
             {
-                size_t res_chars_size = res->chars.size();
                 if (filt_pos[i])
                 {
                     res->chars.resize(res_chars_size + n);
@@ -241,11 +244,11 @@ ColumnPtr ColumnFixedString::permute(const Permutation & perm, size_t limit) con
         throw Exception("Size of permutation is less than required.", ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
 
     if (limit == 0)
-        return std::make_shared<ColumnFixedString>(n);
+        return ColumnFixedString::create(n);
 
-    std::shared_ptr<ColumnFixedString> res = std::make_shared<ColumnFixedString>(n);
+    auto res = ColumnFixedString::create(n);
 
-    Chars_t & res_chars = res->chars;
+    Chars & res_chars = res->chars;
 
     res_chars.resize(n * limit);
 
@@ -256,21 +259,47 @@ ColumnPtr ColumnFixedString::permute(const Permutation & perm, size_t limit) con
     return res;
 }
 
-ColumnPtr ColumnFixedString::replicate(const Offsets_t & offsets) const
+
+ColumnPtr ColumnFixedString::index(const IColumn & indexes, size_t limit) const
+{
+    return selectIndexImpl(*this, indexes, limit);
+}
+
+
+template <typename Type>
+ColumnPtr ColumnFixedString::indexImpl(const PaddedPODArray<Type> & indexes, size_t limit) const
+{
+    if (limit == 0)
+        return ColumnFixedString::create(n);
+
+    auto res = ColumnFixedString::create(n);
+
+    Chars & res_chars = res->chars;
+
+    res_chars.resize(n * limit);
+
+    size_t offset = 0;
+    for (size_t i = 0; i < limit; ++i, offset += n)
+        memcpySmallAllowReadWriteOverflow15(&res_chars[offset], &chars[indexes[i] * n], n);
+
+    return res;
+}
+
+ColumnPtr ColumnFixedString::replicate(const Offsets & offsets) const
 {
     size_t col_size = size();
     if (col_size != offsets.size())
         throw Exception("Size of offsets doesn't match size of column.", ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
 
-    std::shared_ptr<ColumnFixedString> res = std::make_shared<ColumnFixedString>(n);
+    auto res = ColumnFixedString::create(n);
 
     if (0 == col_size)
         return res;
 
-    Chars_t & res_chars = res->chars;
+    Chars & res_chars = res->chars;
     res_chars.resize(n * offsets.back());
 
-    Offset_t curr_offset = 0;
+    Offset curr_offset = 0;
     for (size_t i = 0; i < col_size; ++i)
         for (size_t next_offset = offsets[i]; curr_offset < next_offset; ++curr_offset)
             memcpySmallAllowReadWriteOverflow15(&res->chars[curr_offset * n], &chars[i * n], n);
@@ -278,10 +307,36 @@ ColumnPtr ColumnFixedString::replicate(const Offsets_t & offsets) const
     return res;
 }
 
+void ColumnFixedString::gather(ColumnGathererStream & gatherer)
+{
+    gatherer.gather(*this);
+}
+
 void ColumnFixedString::getExtremes(Field & min, Field & max) const
 {
     min = String();
     max = String();
+
+    size_t col_size = size();
+
+    if (col_size == 0)
+        return;
+
+    size_t min_idx = 0;
+    size_t max_idx = 0;
+
+    less<true> less_op(*this);
+
+    for (size_t i = 1; i < col_size; ++i)
+    {
+        if (less_op(i, min_idx))
+            min_idx = i;
+        else if (less_op(max_idx, i))
+            max_idx = i;
+    }
+
+    get(min_idx, min);
+    get(max_idx, max);
 }
 
 }

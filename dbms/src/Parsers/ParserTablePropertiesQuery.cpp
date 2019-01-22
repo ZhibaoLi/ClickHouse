@@ -11,76 +11,72 @@ namespace DB
 {
 
 
-bool ParserTablePropertiesQuery::parseImpl(Pos & pos, Pos end, ASTPtr & node, Pos & max_parsed_pos, Expected & expected)
+bool ParserTablePropertiesQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
 {
-    Pos begin = pos;
-
-    ParserWhitespaceOrComments ws;
     ParserKeyword s_exists("EXISTS");
+    ParserKeyword s_temporary("TEMPORARY");
     ParserKeyword s_describe("DESCRIBE");
     ParserKeyword s_desc("DESC");
     ParserKeyword s_show("SHOW");
     ParserKeyword s_create("CREATE");
+    ParserKeyword s_database("DATABASE");
     ParserKeyword s_table("TABLE");
-    ParserString s_dot(".");
+    ParserToken s_dot(TokenType::Dot);
     ParserIdentifier name_p;
 
     ASTPtr database;
     ASTPtr table;
     std::shared_ptr<ASTQueryWithTableAndOutput> query;
 
-    ws.ignore(pos, end);
+    bool parse_only_database_name = false;
 
-    if (s_exists.ignore(pos, end, max_parsed_pos, expected))
+    if (s_exists.ignore(pos, expected))
     {
         query = std::make_shared<ASTExistsQuery>();
     }
-    else if (s_describe.ignore(pos, end, max_parsed_pos, expected) || s_desc.ignore(pos, end, max_parsed_pos, expected))
+    else if (s_show.ignore(pos, expected))
     {
-        query = std::make_shared<ASTDescribeQuery>();
-    }
-    else if (s_show.ignore(pos, end, max_parsed_pos, expected))
-    {
-        ws.ignore(pos, end);
-
-        if (!s_create.ignore(pos, end, max_parsed_pos, expected))
+        if (!s_create.ignore(pos, expected))
             return false;
 
-        query = std::make_shared<ASTShowCreateQuery>();
+        if (s_database.ignore(pos, expected))
+        {
+            parse_only_database_name = true;
+            query = std::make_shared<ASTShowCreateDatabaseQuery>();
+        }
+        else
+            query = std::make_shared<ASTShowCreateTableQuery>();
     }
     else
     {
         return false;
     }
 
-    ws.ignore(pos, end);
-
-    s_table.ignore(pos, end, max_parsed_pos, expected);
-
-    ws.ignore(pos, end);
-
-    if (!name_p.parse(pos, end, table, max_parsed_pos, expected))
-        return false;
-
-    ws.ignore(pos, end);
-
-    if (s_dot.ignore(pos, end, max_parsed_pos, expected))
+    if (parse_only_database_name)
     {
-        database = table;
-        if (!name_p.parse(pos, end, table, max_parsed_pos, expected))
+        if (!name_p.parse(pos, database, expected))
+            return false;
+    }
+    else
+    {
+        if (s_temporary.ignore(pos, expected))
+            query->temporary = true;
+
+        s_table.ignore(pos, expected);
+
+        if (!name_p.parse(pos, table, expected))
             return false;
 
-        ws.ignore(pos, end);
+        if (s_dot.ignore(pos, expected))
+        {
+            database = table;
+            if (!name_p.parse(pos, table, expected))
+                return false;
+        }
     }
 
-    ws.ignore(pos, end);
-
-    query->range = StringRange(begin, pos);
-
-    if (database)
-        query->database = typeid_cast<ASTIdentifier &>(*database).name;
-    if (table)
-        query->table = typeid_cast<ASTIdentifier &>(*table).name;
+    getIdentifierName(database, query->database);
+    getIdentifierName(table, query->table);
 
     node = query;
 

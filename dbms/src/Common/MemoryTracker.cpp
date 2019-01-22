@@ -1,11 +1,10 @@
+#include "MemoryTracker.h"
 #include <common/likely.h>
 #include <common/logger_useful.h>
 #include <Common/Exception.h>
 #include <Common/formatReadable.h>
+#include <Common/CurrentThread.h>
 #include <IO/WriteHelpers.h>
-#include <iomanip>
-
-#include <Common/MemoryTracker.h>
 
 
 namespace DB
@@ -17,10 +16,22 @@ namespace DB
 }
 
 
+static constexpr size_t log_peak_memory_usage_every = 1ULL << 30;
+
+
 MemoryTracker::~MemoryTracker()
 {
-    if (peak)
-        logPeakMemoryUsage();
+    if (static_cast<int>(level) < static_cast<int>(VariableContext::Process) && peak)
+    {
+        try
+        {
+            logPeakMemoryUsage();
+        }
+        catch (...)
+        {
+            /// Exception in Logger, intentionally swallow.
+        }
+    }
 
     /** This is needed for next memory tracker to be consistent with sum of all referring memory trackers.
       *
@@ -32,8 +43,8 @@ MemoryTracker::~MemoryTracker()
       *  then memory usage of 'next' memory trackers will be underestimated,
       *  because amount will be decreased twice (first - here, second - when real 'free' happens).
       */
-    if (amount)
-        free(amount);
+    if (auto value = amount.load(std::memory_order_relaxed))
+        free(value);
 }
 
 
@@ -44,12 +55,26 @@ void MemoryTracker::logPeakMemoryUsage() const
         << ": " << formatReadableSizeWithBinarySuffix(peak) << ".");
 }
 
+static void logMemoryUsage(Int64 amount)
+{
+    LOG_DEBUG(&Logger::get("MemoryTracker"),
+        "Current memory usage: " << formatReadableSizeWithBinarySuffix(amount) << ".");
+}
+
+
 
 void MemoryTracker::alloc(Int64 size)
 {
-    Int64 will_be = amount += size;
+    if (blocker.isCancelled())
+        return;
 
-    if (!next)
+    /** Using memory_order_relaxed means that if allocations are done simultaneously,
+      *  we allow exception about memory limit exceeded to be thrown only on next allocation.
+      * So, we allow over-allocations.
+      */
+    Int64 will_be = size + amount.fetch_add(size, std::memory_order_relaxed);
+
+    if (metric != CurrentMetrics::end())
         CurrentMetrics::add(metric, size);
 
     Int64 current_limit = limit.load(std::memory_order_relaxed);
@@ -86,43 +111,69 @@ void MemoryTracker::alloc(Int64 size)
         throw DB::Exception(message.str(), DB::ErrorCodes::MEMORY_LIMIT_EXCEEDED);
     }
 
-    if (will_be > peak.load(std::memory_order_relaxed))        /// Races doesn't matter. Could rewrite with CAS, but not worth.
+    auto peak_old = peak.load(std::memory_order_relaxed);
+    if (will_be > peak_old)        /// Races doesn't matter. Could rewrite with CAS, but not worth.
+    {
         peak.store(will_be, std::memory_order_relaxed);
 
-    if (next)
-        next->alloc(size);
+        if (level == VariableContext::Process && will_be / log_peak_memory_usage_every > peak_old / log_peak_memory_usage_every)
+            logMemoryUsage(will_be);
+    }
+
+    if (auto loaded_next = parent.load(std::memory_order_relaxed))
+        loaded_next->alloc(size);
 }
 
 
 void MemoryTracker::free(Int64 size)
 {
-    /** Sometimes, query could free some data, that was allocated outside of query context.
-      * Example: cache eviction.
-      * To avoid negative memory usage, we "saturate" amount.
-      * Memory usage will be calculated with some error.
-      */
-    Int64 size_to_subtract = size;
-    if (size_to_subtract > amount)
-        size_to_subtract = amount;
+    if (blocker.isCancelled())
+        return;
 
-    amount -= size_to_subtract;
-    /// NOTE above code is not atomic. It's easy to fix.
-
-    if (next)
-        next->free(size);
+    if (level == VariableContext::Thread)
+    {
+        /// Could become negative if memory allocated in this thread is freed in another one
+        amount.fetch_sub(size, std::memory_order_relaxed);
+    }
     else
-        CurrentMetrics::sub(metric, size_to_subtract);
+    {
+        Int64 new_amount = amount.fetch_sub(size, std::memory_order_relaxed) - size;
+
+        /** Sometimes, query could free some data, that was allocated outside of query context.
+          * Example: cache eviction.
+          * To avoid negative memory usage, we "saturate" amount.
+          * Memory usage will be calculated with some error.
+          * NOTE: The code is not atomic. Not worth to fix.
+          */
+        if (unlikely(new_amount < 0))
+        {
+            amount.fetch_sub(new_amount);
+            size += new_amount;
+        }
+    }
+
+    if (auto loaded_next = parent.load(std::memory_order_relaxed))
+        loaded_next->free(size);
+
+    if (metric != CurrentMetrics::end())
+        CurrentMetrics::sub(metric, size);
+}
+
+
+void MemoryTracker::resetCounters()
+{
+    amount.store(0, std::memory_order_relaxed);
+    peak.store(0, std::memory_order_relaxed);
+    limit.store(0, std::memory_order_relaxed);
 }
 
 
 void MemoryTracker::reset()
 {
-    if (!next)
-        CurrentMetrics::sub(metric, amount);
+    if (metric != CurrentMetrics::end())
+        CurrentMetrics::sub(metric, amount.load(std::memory_order_relaxed));
 
-    amount.store(0, std::memory_order_relaxed);
-    peak.store(0, std::memory_order_relaxed);
-    limit.store(0, std::memory_order_relaxed);
+    resetCounters();
 }
 
 
@@ -135,25 +186,25 @@ void MemoryTracker::setOrRaiseLimit(Int64 value)
 }
 
 
-__thread MemoryTracker * current_memory_tracker = nullptr;
-
 namespace CurrentMemoryTracker
 {
     void alloc(Int64 size)
     {
-        if (current_memory_tracker)
-            current_memory_tracker->alloc(size);
+        DB::CurrentThread::getMemoryTracker().alloc(size);
     }
 
     void realloc(Int64 old_size, Int64 new_size)
     {
-        if (current_memory_tracker)
-            current_memory_tracker->alloc(new_size - old_size);
+        DB::CurrentThread::getMemoryTracker().alloc(new_size - old_size);
     }
 
     void free(Int64 size)
     {
-        if (current_memory_tracker)
-            current_memory_tracker->free(size);
+        DB::CurrentThread::getMemoryTracker().free(size);
     }
+}
+
+DB::SimpleActionLock getCurrentMemoryTrackerActionLock()
+{
+    return DB::CurrentThread::getMemoryTracker().blocker.cancel();
 }

@@ -6,6 +6,9 @@
 namespace DB
 {
 
+class Arena;
+using ArenaPtr = std::shared_ptr<Arena>;
+
 class ExpressionActions;
 
 
@@ -19,16 +22,17 @@ private:
     using ExpressionActionsPtr = std::shared_ptr<ExpressionActions>;
 
 public:
+    /// expression may be nullptr
     TotalsHavingBlockInputStream(
-        BlockInputStreamPtr input_,
-        bool overflow_row_, ExpressionActionsPtr expression_,
-        const std::string & filter_column_, TotalsMode totals_mode_, double auto_include_threshold_);
+        const BlockInputStreamPtr & input_,
+        bool overflow_row_, const ExpressionActionsPtr & expression_,
+        const std::string & filter_column_, TotalsMode totals_mode_, double auto_include_threshold_, bool final_);
 
     String getName() const override { return "TotalsHaving"; }
 
-    String getID() const override;
+    Block getTotals() override;
 
-    const Block & getTotals() override;
+    Block getHeader() const override;
 
 protected:
     Block readImpl() override;
@@ -39,6 +43,7 @@ private:
     String filter_column_name;
     TotalsMode totals_mode;
     double auto_include_threshold;
+    bool final;
     size_t passed_keys = 0;
     size_t total_keys = 0;
 
@@ -48,10 +53,12 @@ private:
     Block overflow_aggregates;
 
     /// Here, total values are accumulated. After the work is finished, they will be placed in IProfilingBlockInputStream::totals.
-    Block current_totals;
+    MutableColumns current_totals;
+    /// Arena for aggregate function states in totals.
+    ArenaPtr arena;
 
     /// If filter == nullptr - add all rows. Otherwise, only the rows that pass the filter (HAVING).
-    void addToTotals(Block & totals, Block & block, const IColumn::Filter * filter);
+    void addToTotals(const Block & block, const IColumn::Filter * filter);
 };
 
 }

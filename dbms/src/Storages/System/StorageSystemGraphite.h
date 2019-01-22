@@ -1,33 +1,24 @@
 #pragma once
 
-#include <Storages/IStorage.h>
+#include <DataTypes/DataTypeString.h>
+#include <Storages/System/IStorageSystemOneBlock.h>
 #include <ext/shared_ptr_helper.h>
 
 namespace DB
 {
 
 /// Provides information about Graphite configuration.
-class StorageSystemGraphite : public ext::shared_ptr_helper<StorageSystemGraphite>, public IStorage
+class StorageSystemGraphite : public ext::shared_ptr_helper<StorageSystemGraphite>, public IStorageSystemOneBlock<StorageSystemGraphite>
 {
-friend class ext::shared_ptr_helper<StorageSystemGraphite>;
 public:
     std::string getName() const override { return "SystemGraphite"; }
-    std::string getTableName() const override { return name; }
-    const NamesAndTypesList & getColumnsListImpl() const override { return columns; }
 
-    BlockInputStreams read(
-        const Names & column_names,
-        const ASTPtr & query,
-        const Context & context,
-        QueryProcessingStage::Enum & processed_stage,
-        size_t max_block_size,
-        unsigned num_streams) override;
+    static NamesAndTypesList getNamesAndTypes();
 
-private:
-    const std::string name;
-    NamesAndTypesList columns;
+protected:
+    using IStorageSystemOneBlock::IStorageSystemOneBlock;
 
-    StorageSystemGraphite(const std::string & name_);
+    void fillData(MutableColumns & res_columns, const Context & context, const SelectQueryInfo & query_info) const override;
 };
 
 }

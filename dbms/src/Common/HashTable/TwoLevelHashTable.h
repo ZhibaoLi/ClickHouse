@@ -4,7 +4,7 @@
 
 
 /** Two-level hash table.
-  * Represents 256 (or 1 << BITS_FOR_BUCKET) small hash tables (buckets of the first level).
+  * Represents 256 (or 1ULL << BITS_FOR_BUCKET) small hash tables (buckets of the first level).
   * To determine which one to use, one of the bytes of the hash function is taken.
   *
   * Usually works a little slower than a simple hash table.
@@ -43,11 +43,11 @@ protected:
     friend class iterator;
 
     using HashValue = size_t;
-    using Self = TwoLevelHashTable<Key, Cell, Hash, Grower, Allocator, ImplTable>;
+    using Self = TwoLevelHashTable;
 public:
     using Impl = ImplTable;
 
-    static constexpr size_t NUM_BUCKETS = 1 << BITS_FOR_BUCKET;
+    static constexpr size_t NUM_BUCKETS = 1ULL << BITS_FOR_BUCKET;
     static constexpr size_t MAX_BUCKET = NUM_BUCKETS - 1;
 
     size_t hash(const Key & x) const { return Hash::operator()(x); }
@@ -252,9 +252,8 @@ public:
     }
 
 
-    iterator ALWAYS_INLINE find(Key x)
+    iterator ALWAYS_INLINE find(Key x, size_t hash_value)
     {
-        size_t hash_value = hash(x);
         size_t buck = getBucketFromHash(hash_value);
 
         typename Impl::iterator found = impls[buck].find(x, hash_value);
@@ -264,9 +263,8 @@ public:
     }
 
 
-    const_iterator ALWAYS_INLINE find(Key x) const
+    const_iterator ALWAYS_INLINE find(Key x, size_t hash_value) const
     {
-        size_t hash_value = hash(x);
         size_t buck = getBucketFromHash(hash_value);
 
         typename Impl::const_iterator found = impls[buck].find(x, hash_value);
@@ -274,6 +272,10 @@ public:
             ? const_iterator(this, buck, found)
             : end();
     }
+
+
+    iterator ALWAYS_INLINE find(Key x) { return find(x, hash(x)); }
+    const_iterator ALWAYS_INLINE find(Key x) const { return find(x, hash(x)); }
 
 
     void write(DB::WriteBuffer & wb) const

@@ -3,6 +3,7 @@
 #include <Core/NamesAndTypes.h>
 #include <Storages/MergeTree/RangesInDataPart.h>
 #include <Storages/MergeTree/MergeTreeBlockReadUtils.h>
+#include <Storages/SelectQueryInfo.h>
 #include <mutex>
 
 
@@ -11,7 +12,7 @@ namespace DB
 
 using MergeTreeReadTaskPtr = std::unique_ptr<MergeTreeReadTask>;
 
-/**    Provides read tasks for MergeTreeThreadBlockInputStream`s in fine-grained batches, allowing for more
+/**   Provides read tasks for MergeTreeThreadSelectBlockInputStream`s in fine-grained batches, allowing for more
  *    uniform distribution of work amongst multiple threads. All parts and their ranges are divided into `threads`
  *    workloads with at most `sum_marks / threads` marks. Then, threads are performing reads from these workloads
  *    in "sequential" manner, requesting work in small batches. As soon as some thread has exhausted
@@ -65,13 +66,13 @@ private:
 
 public:
     MergeTreeReadPool(
-        const std::size_t threads, const std::size_t sum_marks, const std::size_t min_marks_for_concurrent_read,
-        RangesInDataParts parts, MergeTreeData & data, const ExpressionActionsPtr & prewhere_actions,
-        const String & prewhere_column_name, const bool check_columns, const Names & column_names,
+        const size_t threads, const size_t sum_marks, const size_t min_marks_for_concurrent_read,
+        RangesInDataParts parts, const MergeTreeData & data, const PrewhereInfoPtr & prewhere_info,
+        const bool check_columns, const Names & column_names,
         const BackoffSettings & backoff_settings, size_t preferred_block_size_bytes,
         const bool do_not_steal_tasks = false);
 
-    MergeTreeReadTaskPtr getTask(const std::size_t min_marks_to_read, const std::size_t thread);
+    MergeTreeReadTaskPtr getTask(const size_t min_marks_to_read, const size_t thread, const Names & ordered_names);
 
     /** Each worker could call this method and pass information about read performance.
       * If read performance is too low, pool could decide to lower number of threads: do not assign more tasks to several threads.
@@ -79,51 +80,56 @@ public:
       */
     void profileFeedback(const ReadBufferFromFileBase::ProfileInfo info);
 
+    /// This method tells which mark ranges we have to read if we start from @from mark range
+    MarkRanges getRestMarks(const std::string & part_path, const MarkRange & from) const;
+
+    Block getHeader() const;
+
 private:
-    std::vector<std::size_t> fillPerPartInfo(
-        RangesInDataParts & parts, const ExpressionActionsPtr & prewhere_actions, const String & prewhere_column_name,
-        const bool check_columns);
+    std::vector<size_t> fillPerPartInfo(
+        RangesInDataParts & parts, const bool check_columns);
 
     void fillPerThreadInfo(
-        const std::size_t threads, const std::size_t sum_marks, std::vector<std::size_t> per_part_sum_marks,
-        RangesInDataParts & parts, const std::size_t min_marks_for_concurrent_read);
+        const size_t threads, const size_t sum_marks, std::vector<size_t> per_part_sum_marks,
+        RangesInDataParts & parts, const size_t min_marks_for_concurrent_read);
 
-    std::vector<std::unique_ptr<Poco::ScopedReadRWLock>> per_part_columns_lock;
-    MergeTreeData & data;
+    std::vector<std::shared_lock<std::shared_mutex>> per_part_columns_lock;
+    const MergeTreeData & data;
     Names column_names;
     bool do_not_steal_tasks;
     bool predict_block_size_bytes;
     std::vector<NameSet> per_part_column_name_set;
     std::vector<NamesAndTypesList> per_part_columns;
     std::vector<NamesAndTypesList> per_part_pre_columns;
-    /// @todo actually all of these values are either true or false for the whole query, thus no vector required
-    std::vector<char> per_part_remove_prewhere_column;
     std::vector<char> per_part_should_reorder;
     std::vector<MergeTreeBlockSizePredictorPtr> per_part_size_predictor;
+    PrewhereInfoPtr prewhere_info;
 
     struct Part
     {
         MergeTreeData::DataPartPtr data_part;
-        std::size_t part_index_in_query;
+        size_t part_index_in_query;
     };
 
-    std::vector<Part> parts;
+    std::vector<Part> parts_with_idx;
 
     struct ThreadTask
     {
         struct PartIndexAndRange
         {
-            std::size_t part_idx;
+            size_t part_idx;
             MarkRanges ranges;
         };
 
         std::vector<PartIndexAndRange> parts_and_ranges;
-        std::vector<std::size_t> sum_marks_in_parts;
+        std::vector<size_t> sum_marks_in_parts;
     };
 
     std::vector<ThreadTask> threads_tasks;
 
-    std::set<std::size_t> remaining_thread_tasks;
+    std::set<size_t> remaining_thread_tasks;
+
+    RangesInDataParts parts_ranges;
 
     mutable std::mutex mutex;
 

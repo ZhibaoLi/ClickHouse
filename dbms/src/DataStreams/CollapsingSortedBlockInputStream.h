@@ -23,39 +23,22 @@ namespace DB
 class CollapsingSortedBlockInputStream : public MergingSortedBlockInputStream
 {
 public:
-    CollapsingSortedBlockInputStream(BlockInputStreams inputs_, const SortDescription & description_,
-        const String & sign_column_, size_t max_block_size_, MergedRowSources * out_row_sources_ = nullptr)
-        : MergingSortedBlockInputStream(inputs_, description_, max_block_size_, 0, out_row_sources_),
-        sign_column(sign_column_)
+    CollapsingSortedBlockInputStream(
+            BlockInputStreams inputs_, const SortDescription & description_,
+            const String & sign_column, size_t max_block_size_, WriteBuffer * out_row_sources_buf_ = nullptr)
+        : MergingSortedBlockInputStream(inputs_, description_, max_block_size_, 0, out_row_sources_buf_)
     {
+        sign_column_number = header.getPositionByName(sign_column);
     }
 
     String getName() const override { return "CollapsingSorted"; }
-
-    String getID() const override
-    {
-        std::stringstream res;
-        res << "CollapsingSorted(inputs";
-
-        for (size_t i = 0; i < children.size(); ++i)
-            res << ", " << children[i]->getID();
-
-        res << ", description";
-
-        for (size_t i = 0; i < description.size(); ++i)
-            res << ", " << description[i].getID();
-
-        res << ", sign_column, " << sign_column << ")";
-        return res.str();
-    }
 
 protected:
     /// Can return 1 more records than max_block_size.
     Block readImpl() override;
 
 private:
-    String sign_column;
-    size_t sign_column_number = 0;
+    size_t sign_column_number;
 
     Logger * log = &Logger::get("CollapsingSortedBlockInputStream");
 
@@ -77,20 +60,21 @@ private:
 
     size_t blocks_written = 0;
 
-    /// Fields specific for VERTICAL merge algorithm
-    size_t current_pos = 0;            /// Global row number of current key
-    size_t first_negative_pos = 0;    /// Global row number of first_negative
-    size_t last_positive_pos = 0;    /// Global row number of last_positive
-    size_t last_negative_pos = 0;    /// Global row number of last_negative
+    /// Fields specific for VERTICAL merge algorithm.
+    /// Row numbers are relative to the start of current primary key.
+    size_t current_pos = 0;                        /// Current row number
+    size_t first_negative_pos = 0;                 /// Row number of first_negative
+    size_t last_positive_pos = 0;                  /// Row number of last_positive
+    size_t last_negative_pos = 0;                  /// Row number of last_negative
+    PODArray<RowSourcePart> current_row_sources;   /// Sources of rows with the current primary key
 
     /** We support two different cursors - with Collation and without.
      *  Templates are used instead of polymorphic SortCursors and calls to virtual functions.
      */
-    template<class TSortCursor>
-    void merge(ColumnPlainPtrs & merged_columns, std::priority_queue<TSortCursor> & queue);
+    void merge(MutableColumns & merged_columns, std::priority_queue<SortCursor> & queue);
 
     /// Output to result rows for the current primary key.
-    void insertRows(ColumnPlainPtrs & merged_columns, size_t & merged_rows, bool last_in_stream = false);
+    void insertRows(MutableColumns & merged_columns, size_t & merged_rows);
 
     void reportIncorrectData();
 };

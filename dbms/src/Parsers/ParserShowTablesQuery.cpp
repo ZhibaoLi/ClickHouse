@@ -13,12 +13,10 @@ namespace DB
 {
 
 
-bool ParserShowTablesQuery::parseImpl(Pos & pos, Pos end, ASTPtr & node, Pos & max_parsed_pos, Expected & expected)
+bool ParserShowTablesQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
 {
-    Pos begin = pos;
-
-    ParserWhitespaceOrComments ws;
     ParserKeyword s_show("SHOW");
+    ParserKeyword s_temporary("TEMPORARY");
     ParserKeyword s_tables("TABLES");
     ParserKeyword s_databases("DATABASES");
     ParserKeyword s_from("FROM");
@@ -32,57 +30,42 @@ bool ParserShowTablesQuery::parseImpl(Pos & pos, Pos end, ASTPtr & node, Pos & m
 
     auto query = std::make_shared<ASTShowTablesQuery>();
 
-    ws.ignore(pos, end);
-
-    if (!s_show.ignore(pos, end, max_parsed_pos, expected))
+    if (!s_show.ignore(pos, expected))
         return false;
 
-    ws.ignore(pos, end);
-
-    if (s_databases.ignore(pos, end))
+    if (s_databases.ignore(pos))
     {
         query->databases = true;
     }
-    else if (s_tables.ignore(pos, end, max_parsed_pos, expected))
+    else
     {
-        ws.ignore(pos, end);
+        if (s_temporary.ignore(pos))
+            query->temporary = true;
 
-        if (s_from.ignore(pos, end, max_parsed_pos, expected))
+        if (s_tables.ignore(pos, expected))
         {
-            ws.ignore(pos, end);
+            if (s_from.ignore(pos, expected))
+            {
+                if (!name_p.parse(pos, database, expected))
+                    return false;
+            }
 
-            if (!name_p.parse(pos, end, database, max_parsed_pos, expected))
+            if (s_not.ignore(pos, expected))
+                query->not_like = true;
+
+            if (s_like.ignore(pos, expected))
+            {
+                if (!like_p.parse(pos, like, expected))
+                    return false;
+            }
+            else if (query->not_like)
                 return false;
         }
-
-        ws.ignore(pos, end);
-
-        if (s_not.ignore(pos, end, max_parsed_pos, expected))
-        {
-            ws.ignore(pos, end);
-
-            query->not_like = true;
-        }
-
-        if (s_like.ignore(pos, end, max_parsed_pos, expected))
-        {
-            ws.ignore(pos, end);
-
-            if (!like_p.parse(pos, end, like, max_parsed_pos, expected))
-                return false;
-        }
-        else if (query->not_like)
+        else
             return false;
     }
-    else
-        return false;
 
-    ws.ignore(pos, end);
-
-    query->range = StringRange(begin, pos);
-
-    if (database)
-        query->from = typeid_cast<ASTIdentifier &>(*database).name;
+    getIdentifierName(database, query->from);
     if (like)
         query->like = safeGet<const String &>(typeid_cast<ASTLiteral &>(*like).value);
 

@@ -2,9 +2,9 @@
 #include <Parsers/queryToString.h>
 #include <Parsers/CommonParsers.h>
 #include <Parsers/ExpressionElementParsers.h>
-#include <Parsers/ASTIdentifier.h>
-#include <Parsers/ASTLiteral.h>
+#include <Parsers/parseIdentifierOrStringLiteral.h>
 #include <Common/typeid_cast.h>
+#include <Interpreters/evaluateConstantExpression.h>
 
 
 namespace DB
@@ -16,32 +16,12 @@ std::string ASTQueryWithOnCluster::getRewrittenQueryWithoutOnCluster(const std::
 }
 
 
-bool ASTQueryWithOnCluster::parse(Pos & pos, Pos end, std::string & cluster_str, Pos & max_parsed_pos, Expected & expected)
+bool ASTQueryWithOnCluster::parse(Pos & pos, std::string & cluster_str, Expected & expected)
 {
-    ParserWhitespaceOrComments ws;
-
-    ws.ignore(pos, end);
-
-    if (!ParserKeyword{"CLUSTER"}.ignore(pos, end, max_parsed_pos, expected))
+    if (!ParserKeyword{"CLUSTER"}.ignore(pos, expected))
         return false;
 
-    ws.ignore(pos, end);
-
-    Pos begin = pos;
-    ASTPtr res;
-
-    if (!ParserIdentifier().parse(pos, end, res, max_parsed_pos, expected))
-    {
-        pos = begin;
-        if (!ParserStringLiteral().parse(pos, end, res, max_parsed_pos, expected))
-            return false;
-        else
-            cluster_str = typeid_cast<const ASTLiteral &>(*res).value.safeGet<String>();
-    }
-    else
-        cluster_str = typeid_cast<const ASTIdentifier &>(*res).name;
-
-    return true;
+    return parseIdentifierOrStringLiteral(pos, expected, cluster_str);
 }
 
 

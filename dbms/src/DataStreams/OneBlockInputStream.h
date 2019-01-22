@@ -16,11 +16,12 @@ public:
 
     String getName() const override { return "One"; }
 
-    String getID() const override
+    Block getHeader() const override
     {
-        std::stringstream res;
-        res << this;
-        return res.str();
+        Block res;
+        for (const auto & elem : block)
+            res.insert({ elem.column->cloneEmpty(), elem.type, elem.name });
+        return res;
     }
 
 protected:

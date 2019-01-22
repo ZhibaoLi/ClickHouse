@@ -12,17 +12,13 @@ class ProcessListEntry;
 struct BlockIO
 {
     /** process_list_entry should be destroyed after in and after out,
-      *  since in and out contain pointer to an object inside process_list_entry
-      *  (MemoryTracker * current_memory_tracker),
+      *  since in and out contain pointer to objects inside process_list_entry (query-level MemoryTracker for example),
       *  which could be used before destroying of in and out.
       */
     std::shared_ptr<ProcessListEntry> process_list_entry;
 
     BlockInputStreamPtr in;
     BlockOutputStreamPtr out;
-
-    Block in_sample;    /// Example of a block to be read from `in`.
-    Block out_sample;   /// Example of a block to be written to `out`.
 
     /// Callbacks for query logging could be set here.
     std::function<void(IBlockInputStream *, IBlockOutputStream *)>    finish_callback;
@@ -41,18 +37,21 @@ struct BlockIO
             exception_callback();
     }
 
+    /// We provide the correct order of destruction.
+    void reset()
+    {
+        out.reset();
+        in.reset();
+        process_list_entry.reset();
+    }
+
     BlockIO & operator= (const BlockIO & rhs)
     {
-        /// We provide the correct order of destruction.
-        out                     = nullptr;
-        in                      = nullptr;
-        process_list_entry      = nullptr;
+        reset();
 
         process_list_entry      = rhs.process_list_entry;
         in                      = rhs.in;
         out                     = rhs.out;
-        in_sample               = rhs.in_sample;
-        out_sample              = rhs.out_sample;
 
         finish_callback         = rhs.finish_callback;
         exception_callback      = rhs.exception_callback;
@@ -61,6 +60,8 @@ struct BlockIO
     }
 
     ~BlockIO();
+    BlockIO();
+    BlockIO(const BlockIO &);
 };
 
 }

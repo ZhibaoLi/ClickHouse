@@ -1,8 +1,8 @@
 #include <Common/OptimizedRegularExpression.h>
+#include <Common/typeid_cast.h>
 
 #include <Storages/StorageMerge.h>
 #include <Parsers/ASTExpressionList.h>
-#include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTFunction.h>
 #include <TableFunctions/ITableFunction.h>
@@ -32,7 +32,7 @@ static NamesAndTypesList chooseColumns(const String & source_database, const Str
 
     {
         auto database = context.getDatabase(source_database);
-        auto iterator = database->getIterator();
+        auto iterator = database->getIterator(context);
 
         while (iterator->isValid())
         {
@@ -50,11 +50,11 @@ static NamesAndTypesList chooseColumns(const String & source_database, const Str
         throw Exception("Error while executing table function merge. In database " + source_database + " no one matches regular expression: "
             + table_name_regexp_, ErrorCodes::UNKNOWN_TABLE);
 
-    return any_table->getColumnsList();
+    return any_table->getColumns().getAllPhysical();
 }
 
 
-StoragePtr TableFunctionMerge::execute(const ASTPtr & ast_function, const Context & context) const
+StoragePtr TableFunctionMerge::executeImpl(const ASTPtr & ast_function, const Context & context) const
 {
     ASTs & args_func = typeid_cast<ASTFunction &>(*ast_function).children;
 
@@ -70,7 +70,7 @@ StoragePtr TableFunctionMerge::execute(const ASTPtr & ast_function, const Contex
             " - name of source database and regexp for table names.",
             ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
 
-    args[0] = evaluateConstantExpressionOrIdentidierAsLiteral(args[0], context);
+    args[0] = evaluateConstantExpressionOrIdentifierAsLiteral(args[0], context);
     args[1] = evaluateConstantExpressionAsLiteral(args[1], context);
 
     String source_database = static_cast<const ASTLiteral &>(*args[0]).value.safeGet<String>();
@@ -78,7 +78,7 @@ StoragePtr TableFunctionMerge::execute(const ASTPtr & ast_function, const Contex
 
     auto res = StorageMerge::create(
         getName(),
-        std::make_shared<NamesAndTypesList>(chooseColumns(source_database, table_name_regexp, context)),
+        ColumnsDescription{chooseColumns(source_database, table_name_regexp, context)},
         source_database,
         table_name_regexp,
         context);
@@ -89,7 +89,7 @@ StoragePtr TableFunctionMerge::execute(const ASTPtr & ast_function, const Contex
 
 void registerTableFunctionMerge(TableFunctionFactory & factory)
 {
-    TableFunctionFactory::instance().registerFunction<TableFunctionMerge>();
+    factory.registerFunction<TableFunctionMerge>();
 }
 
 }

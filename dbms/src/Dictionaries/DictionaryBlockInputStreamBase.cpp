@@ -1,18 +1,10 @@
-#include <Dictionaries/DictionaryBlockInputStreamBase.h>
+#include "DictionaryBlockInputStreamBase.h"
 
 namespace DB
 {
-
 DictionaryBlockInputStreamBase::DictionaryBlockInputStreamBase(size_t rows_count, size_t max_block_size)
-    : rows_count(rows_count), max_block_size(max_block_size), next_row(0)
+    : rows_count(rows_count), max_block_size(max_block_size)
 {
-}
-
-String DictionaryBlockInputStreamBase::getID() const
-{
-    std::stringstream ss;
-    ss << static_cast<const void*>(this);
-    return ss.str();
 }
 
 Block DictionaryBlockInputStreamBase::readImpl()
@@ -24,6 +16,11 @@ Block DictionaryBlockInputStreamBase::readImpl()
     Block block = getBlock(next_row, block_size);
     next_row += block_size;
     return block;
+}
+
+Block DictionaryBlockInputStreamBase::getHeader() const
+{
+    return getBlock(0, 0);
 }
 
 }

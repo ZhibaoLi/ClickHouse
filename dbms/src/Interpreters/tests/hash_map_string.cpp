@@ -15,7 +15,7 @@
 #include <Core/Types.h>
 #include <IO/ReadBufferFromFile.h>
 #include <IO/ReadHelpers.h>
-#include <IO/CompressedReadBuffer.h>
+#include <Compression/CompressedReadBuffer.h>
 #include <common/StringRef.h>
 #include <Common/HashTable/HashMap.h>
 #include <Interpreters/AggregationCommon.h>
@@ -40,7 +40,7 @@ struct CompactStringRef
     }
 
     CompactStringRef(const unsigned char * data_, size_t size_) : CompactStringRef(reinterpret_cast<const char *>(data_), size_) {}
-    CompactStringRef(const std::string & s) : CompactStringRef(s.data(), s.size()) {}
+    explicit CompactStringRef(const std::string & s) : CompactStringRef(s.data(), s.size()) {}
     CompactStringRef() {}
 
     const char * data() const { return reinterpret_cast<const char *>(reinterpret_cast<intptr_t>(data_mixed) & 0x0000FFFFFFFFFFFFULL); }
@@ -69,7 +69,7 @@ namespace ZeroTraits
 
     template <>
     inline void set<CompactStringRef>(CompactStringRef & x) { x.data_mixed = nullptr; }
-};
+}
 
 template <>
 struct DefaultHash<CompactStringRef>
@@ -81,10 +81,13 @@ struct DefaultHash<CompactStringRef>
 };
 
 
-#define mix(h) ({                   \
-    (h) ^= (h) >> 23;               \
-    (h) *= 0x2127599bf4325c37ULL;   \
-    (h) ^= (h) >> 47; })
+static inline UInt64 mix(UInt64 h)
+{
+    h ^= h >> 23;
+    h *= 0x2127599bf4325c37ULL;
+    h ^= h >> 47;
+    return h;
+}
 
 struct FastHash64
 {
@@ -100,7 +103,8 @@ struct FastHash64
         UInt64 h = len * m;
         UInt64 v;
 
-        while (pos != end) {
+        while (pos != end)
+        {
             v = *pos++;
             h ^= mix(v);
             h *= m;
@@ -109,16 +113,17 @@ struct FastHash64
         pos2 = reinterpret_cast<const unsigned char*>(pos);
         v = 0;
 
-        switch (len & 7) {
-        case 7: v ^= static_cast<UInt64>(pos2[6]) << 48;
-        case 6: v ^= static_cast<UInt64>(pos2[5]) << 40;
-        case 5: v ^= static_cast<UInt64>(pos2[4]) << 32;
-        case 4: v ^= static_cast<UInt64>(pos2[3]) << 24;
-        case 3: v ^= static_cast<UInt64>(pos2[2]) << 16;
-        case 2: v ^= static_cast<UInt64>(pos2[1]) << 8;
-        case 1: v ^= static_cast<UInt64>(pos2[0]);
-            h ^= mix(v);
-            h *= m;
+        switch (len & 7)
+        {
+            case 7: v ^= static_cast<UInt64>(pos2[6]) << 48; [[fallthrough]];
+            case 6: v ^= static_cast<UInt64>(pos2[5]) << 40; [[fallthrough]];
+            case 5: v ^= static_cast<UInt64>(pos2[4]) << 32; [[fallthrough]];
+            case 4: v ^= static_cast<UInt64>(pos2[3]) << 24; [[fallthrough]];
+            case 3: v ^= static_cast<UInt64>(pos2[2]) << 16; [[fallthrough]];
+            case 2: v ^= static_cast<UInt64>(pos2[1]) << 8; [[fallthrough]];
+            case 1: v ^= static_cast<UInt64>(pos2[0]);
+                h ^= mix(v);
+                h *= m;
         }
 
         return mix(h);
@@ -126,11 +131,11 @@ struct FastHash64
 };
 
 
+#if __x86_64__
 struct CrapWow
 {
     size_t operator() (CompactStringRef x) const
     {
-#if __x86_64__
         const char * key = x.data();
         size_t len = x.size;
         size_t seed = 0;
@@ -194,11 +199,9 @@ struct CrapWow
             : "%r12", "%r13", "%r14", "%r15", "cc"
         );
         return hash;
-#else
-        return 0;
-#endif
     }
 };
+#endif
 
 
 struct SimpleHash
@@ -249,13 +252,13 @@ struct Grower : public HashTableGrower<>
     static const size_t initial_size_degree = 16;
     Grower() { size_degree = initial_size_degree; }
 
-    size_t max_fill = (1 << initial_size_degree) * 0.9;
+    size_t max_fill = (1ULL << initial_size_degree) * 0.9;
 
     /// The size of the hash table in the cells.
-    size_t bufSize() const                { return 1 << size_degree; }
+    size_t bufSize() const               { return 1ULL << size_degree; }
 
-    size_t maxFill() const                { return max_fill /*1 << (size_degree - 1)*/; }
-    size_t mask() const                    { return bufSize() - 1; }
+    size_t maxFill() const               { return max_fill /*1 << (size_degree - 1)*/; }
+    size_t mask() const                  { return bufSize() - 1; }
 
     /// From the hash value, get the cell number in the hash table.
     size_t place(size_t x) const         { return x & mask(); }
@@ -270,11 +273,11 @@ struct Grower : public HashTableGrower<>
     void increaseSize()
     {
         size_degree += size_degree >= 23 ? 1 : 2;
-        max_fill = (1 << size_degree) * 0.9;
+        max_fill = (1ULL << size_degree) * 0.9;
     }
 
     /// Set the buffer size by the number of elements in the hash table. Used when deserializing a hash table.
-    void set(size_t num_elems)
+    void set(size_t /*num_elems*/)
     {
         throw Poco::Exception(__PRETTY_FUNCTION__);
     }
@@ -283,6 +286,12 @@ struct Grower : public HashTableGrower<>
 
 int main(int argc, char ** argv)
 {
+    if (argc < 3)
+    {
+        std::cerr << "Usage: program n m\n";
+        return 1;
+    }
+
     size_t n = atoi(argv[1]);
     size_t m = atoi(argv[2]);
 
@@ -372,6 +381,7 @@ int main(int argc, char ** argv)
             << std::endl;
     }
 
+#if __x86_64__
     if (!m || m == 3)
     {
         Stopwatch watch;
@@ -400,6 +410,7 @@ int main(int argc, char ** argv)
 #endif
             << std::endl;
     }
+#endif
 
     if (!m || m == 4)
     {
@@ -434,7 +445,7 @@ int main(int argc, char ** argv)
     {
         Stopwatch watch;
 
-        std::unordered_map<Key, Value, DefaultHash<Key> > map;
+        std::unordered_map<Key, Value, DefaultHash<Key>> map;
         for (size_t i = 0; i < n; ++i)
             ++map[data[i]];
 
@@ -450,7 +461,7 @@ int main(int argc, char ** argv)
     {
         Stopwatch watch;
 
-        google::dense_hash_map<Key, Value, DefaultHash<Key> > map;
+        google::dense_hash_map<Key, Value, DefaultHash<Key>> map;
         map.set_empty_key(Key("\0", 1));
         for (size_t i = 0; i < n; ++i)
               ++map[data[i]];
@@ -467,7 +478,7 @@ int main(int argc, char ** argv)
     {
         Stopwatch watch;
 
-        google::sparse_hash_map<Key, Value, DefaultHash<Key> > map;
+        google::sparse_hash_map<Key, Value, DefaultHash<Key>> map;
         for (size_t i = 0; i < n; ++i)
             ++map[data[i]];
 

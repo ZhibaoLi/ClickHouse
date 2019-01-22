@@ -1,29 +1,32 @@
 #include <fcntl.h>
-#include <unistd.h>
+#include <port/unistd.h>
 #include <stdlib.h>
 #include <time.h>
-
 #include <iostream>
 #include <iomanip>
 #include <vector>
 #include <random>
-
-#include <Poco/NumberParser.h>
-#include <Poco/NumberFormatter.h>
+#include <pcg_random.hpp>
+#include <IO/ReadHelpers.h>
 #include <Poco/Exception.h>
-
 #include <Common/Exception.h>
-
+#include <Common/randomSeed.h>
 #include <common/ThreadPool.h>
 #include <Common/Stopwatch.h>
-
+#include <IO/BufferWithOwnMemory.h>
 #include <cstdlib>
+#include <port/clock.h>
 
-#ifdef __APPLE__
-#include <common/apple_rt.h>
-#endif
-
-using DB::throwFromErrno;
+namespace DB
+{
+    namespace ErrorCodes
+    {
+        extern const int CANNOT_OPEN_FILE;
+        extern const int CANNOT_CLOSE_FILE;
+        extern const int CANNOT_READ_FROM_FILE_DESCRIPTOR;
+        extern const int CANNOT_WRITE_TO_FILE_DESCRIPTOR;
+    }
+}
 
 
 enum Mode
@@ -37,42 +40,20 @@ enum Mode
 };
 
 
-struct AlignedBuffer
-{
-    int size;
-    char * data;
-
-    AlignedBuffer(int size_)
-    {
-        size_t page = sysconf(_SC_PAGESIZE);
-        size = size_;
-        int rc = posix_memalign(reinterpret_cast<void **>(&data), page, (size + page - 1) / page * page);
-        if (data == nullptr || rc != 0)
-            throwFromErrno("memalign failed");
-    }
-
-    ~AlignedBuffer()
-    {
-        free(data);
-    }
-};
-
 void thread(int fd, int mode, size_t min_offset, size_t max_offset, size_t block_size, size_t count)
 {
-    AlignedBuffer direct_buf(block_size);
+    using namespace DB;
+
+    Memory direct_buf(block_size, sysconf(_SC_PAGESIZE));
     std::vector<char> simple_buf(block_size);
 
     char * buf;
     if ((mode & MODE_DIRECT))
-        buf = direct_buf.data;
+        buf = direct_buf.data();
     else
         buf = &simple_buf[0];
 
-    std::mt19937 rng;
-
-    timespec times;
-    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &times);
-    rng.seed(times.tv_nsec);
+    pcg64 rng(randomSeed());
 
     for (size_t i = 0; i < count; ++i)
     {
@@ -90,12 +71,12 @@ void thread(int fd, int mode, size_t min_offset, size_t max_offset, size_t block
         if (mode & MODE_READ)
         {
             if (static_cast<int>(block_size) != pread(fd, buf, block_size, offset))
-                throwFromErrno("Cannot read");
+                throwFromErrno("Cannot read", ErrorCodes::CANNOT_READ_FROM_FILE_DESCRIPTOR);
         }
         else
         {
             if (static_cast<int>(block_size) != pwrite(fd, buf, block_size, offset))
-                throwFromErrno("Cannot write");
+                throwFromErrno("Cannot write", ErrorCodes::CANNOT_WRITE_TO_FILE_DESCRIPTOR);
         }
     }
 }
@@ -103,13 +84,15 @@ void thread(int fd, int mode, size_t min_offset, size_t max_offset, size_t block
 
 int mainImpl(int argc, char ** argv)
 {
+    using namespace DB;
+
     const char * file_name = 0;
     int mode = MODE_NONE;
-    size_t min_offset = 0;
-    size_t max_offset = 0;
-    size_t block_size = 0;
-    size_t threads = 0;
-    size_t count = 0;
+    UInt64 min_offset = 0;
+    UInt64 max_offset = 0;
+    UInt64 block_size = 0;
+    UInt64 threads = 0;
+    UInt64 count = 0;
 
     if (argc != 8)
     {
@@ -119,11 +102,11 @@ int mainImpl(int argc, char ** argv)
     }
 
     file_name = argv[1];
-    min_offset = Poco::NumberParser::parseUnsigned64(argv[3]);
-    max_offset = Poco::NumberParser::parseUnsigned64(argv[4]);
-    block_size = Poco::NumberParser::parseUnsigned64(argv[5]);
-    threads = Poco::NumberParser::parseUnsigned(argv[6]);
-    count = Poco::NumberParser::parseUnsigned(argv[7]);
+    min_offset = parse<UInt64>(argv[3]);
+    max_offset = parse<UInt64>(argv[4]);
+    block_size = parse<UInt64>(argv[5]);
+    threads = parse<UInt64>(argv[6]);
+    count = parse<UInt64>(argv[7]);
 
     for (int i = 0; argv[2][i]; ++i)
     {
@@ -158,11 +141,11 @@ int mainImpl(int argc, char ** argv)
     int fd = open(file_name, ((mode & MODE_READ) ? O_RDONLY : O_WRONLY) | ((mode & MODE_SYNC) ? O_SYNC : 0));
     #endif
     if (-1 == fd)
-        throwFromErrno("Cannot open file");
+        throwFromErrno("Cannot open file", ErrorCodes::CANNOT_OPEN_FILE);
     #ifdef __APPLE__
     if (mode & MODE_DIRECT)
         if (fcntl(fd, F_NOCACHE, 1) == -1)
-            throwFromErrno("Cannot open file");
+            throwFromErrno("Cannot open file", ErrorCodes::CANNOT_CLOSE_FILE);
     #endif
     Stopwatch watch;
 
@@ -175,7 +158,7 @@ int mainImpl(int argc, char ** argv)
     watch.stop();
 
     if (0 != close(fd))
-        throwFromErrno("Cannot close file");
+        throwFromErrno("Cannot close file", ErrorCodes::CANNOT_CLOSE_FILE);
 
     std::cout << std::fixed << std::setprecision(2)
         << "Done " << count << " * " << threads << " ops";

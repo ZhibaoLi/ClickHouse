@@ -2,22 +2,21 @@
 
 #include <Core/Block.h>
 #include <DataStreams/IProfilingBlockInputStream.h>
-#include <Dictionaries/ExternalResultDescription.h>
+#include "ExternalResultDescription.h"
 
 
 namespace Poco
 {
-    namespace MongoDB
-    {
-        class Connection;
-        class Cursor;
-    }
+namespace MongoDB
+{
+    class Connection;
+    class Cursor;
+}
 }
 
 
 namespace DB
 {
-
 /// Converts MongoDB Cursor to a stream of Blocks
 class MongoDBBlockInputStream final : public IProfilingBlockInputStream
 {
@@ -32,15 +31,10 @@ public:
 
     String getName() const override { return "MongoDB"; }
 
-    String getID() const override;
+    Block getHeader() const override { return description.sample_block.cloneEmpty(); }
 
 private:
     Block readImpl() override;
-
-    static void insertDefaultValue(IColumn * column, const IColumn & sample_column)
-    {
-        column->insertFrom(sample_column, 0);
-    }
 
     std::shared_ptr<Poco::MongoDB::Connection> connection;
     std::unique_ptr<Poco::MongoDB::Cursor> cursor;

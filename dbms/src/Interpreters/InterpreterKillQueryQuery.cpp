@@ -2,9 +2,11 @@
 #include <Parsers/ASTKillQueryQuery.h>
 #include <Parsers/queryToString.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/DDLWorker.h>
 #include <Interpreters/ProcessList.h>
 #include <Interpreters/executeQuery.h>
 #include <Columns/ColumnString.h>
+#include <Common/typeid_cast.h>
 #include <DataTypes/DataTypeString.h>
 #include <Columns/ColumnsNumber.h>
 #include <DataTypes/DataTypesNumber.h>
@@ -21,6 +23,7 @@ namespace ErrorCodes
 {
     extern const int READONLY;
     extern const int LOGICAL_ERROR;
+    extern const int CANNOT_KILL;
 }
 
 
@@ -40,7 +43,7 @@ static const char * cancellationCodeToStatus(CancellationCode code)
             return "waiting";
         default:
             return "unknown_status";
-    };
+    }
 }
 
 
@@ -58,15 +61,12 @@ struct QueryDescriptor
 using QueryDescriptors = std::vector<QueryDescriptor>;
 
 
-static void insertResultRow(size_t n, CancellationCode code, const Block & source_processes, Block & res)
+static void insertResultRow(size_t n, CancellationCode code, const Block & source_processes, const Block & sample_block, MutableColumns & columns)
 {
-    res.getByPosition(0).column->insert(String(cancellationCodeToStatus(code)));
+    columns[0]->insert(cancellationCodeToStatus(code));
 
-    for (size_t col_num = 1; col_num < res.columns(); ++col_num)
-    {
-        ColumnWithTypeAndName & dst_col = res.getByPosition(col_num);
-        dst_col.column->insertFrom(*source_processes.getByName(dst_col.name).column, n);
-    }
+    for (size_t col_num = 1, size = columns.size(); col_num < size; ++col_num)
+        columns[col_num]->insertFrom(*source_processes.getByName(sample_block.getByPosition(col_num).name).column, n);
 }
 
 static QueryDescriptors extractQueriesExceptMeAndCheckAccess(const Block & processes_block, Context & context)
@@ -77,7 +77,7 @@ static QueryDescriptors extractQueriesExceptMeAndCheckAccess(const Block & proce
 
     const ColumnString & query_id_col = typeid_cast<const ColumnString &>(*processes_block.getByName("query_id").column);
     const ColumnString & user_col = typeid_cast<const ColumnString &>(*processes_block.getByName("user").column);
-    const ClientInfo & my_client = context.getProcessListElement()->client_info;
+    const ClientInfo & my_client = context.getProcessListElement()->getClientInfo();
 
     for (size_t i = 0; i < num_processes; ++i)
     {
@@ -87,7 +87,7 @@ static QueryDescriptors extractQueriesExceptMeAndCheckAccess(const Block & proce
         if (my_client.current_query_id == query_id && my_client.current_user == user)
             continue;
 
-        if (context.getSettingsRef().limits.readonly && my_client.current_user != user)
+        if (context.getSettingsRef().readonly && my_client.current_user != user)
         {
             throw Exception("Readonly user " + my_client.current_user + " attempts to kill query created by " + user,
                     ErrorCodes::READONLY);
@@ -104,15 +104,14 @@ static QueryDescriptors extractQueriesExceptMeAndCheckAccess(const Block & proce
 class SyncKillQueryInputStream : public IProfilingBlockInputStream
 {
 public:
-
     SyncKillQueryInputStream(ProcessList & process_list_, QueryDescriptors && processes_to_stop_, Block && processes_block_,
                              const Block & res_sample_block_)
-    :     process_list(process_list_),
+        : process_list(process_list_),
         processes_to_stop(std::move(processes_to_stop_)),
         processes_block(std::move(processes_block_)),
         res_sample_block(res_sample_block_)
     {
-        total_rows_approx = processes_to_stop.size();
+        addTotalRowsApprox(processes_to_stop.size());
     }
 
     String getName() const override
@@ -120,10 +119,7 @@ public:
         return "SynchronousQueryKiller";
     }
 
-    String getID() const override
-    {
-        return "SynchronousQueryKiller_" + toString(intptr_t(this));
-    }
+    Block getHeader() const override { return res_sample_block; }
 
     Block readImpl() override
     {
@@ -132,7 +128,7 @@ public:
         if (num_processed_queries >= num_result_queries)
             return Block();
 
-        Block res = res_sample_block.cloneEmpty();
+        MutableColumns columns = res_sample_block.cloneEmptyColumns();
 
         do
         {
@@ -141,20 +137,23 @@ public:
                 if (curr_process.processed)
                     continue;
 
-                auto code = process_list.sendCancelToQuery(curr_process.query_id, curr_process.user);
+                auto code = process_list.sendCancelToQuery(curr_process.query_id, curr_process.user, true);
 
-                if (code != CancellationCode::QueryIsNotInitializedYet && code != CancellationCode::CancelSent)
+                /// Raise exception if this query is immortal, user have to know
+                /// This could happen only if query generate streams that don't implement IProfilingBlockInputStream
+                if (code == CancellationCode::CancelCannotBeSent)
+                    throw Exception("Can't kill query '" + curr_process.query_id + "' it consits of unkillable stages", ErrorCodes::CANNOT_KILL);
+                else if (code != CancellationCode::QueryIsNotInitializedYet && code != CancellationCode::CancelSent)
                 {
                     curr_process.processed = true;
-                    insertResultRow(curr_process.source_num, code, processes_block, res);
+                    insertResultRow(curr_process.source_num, code, processes_block, res_sample_block, columns);
                     ++num_processed_queries;
                 }
-                /// Wait if QueryIsNotInitializedYet or CancelSent
+                /// Wait if CancelSent
             }
 
             /// KILL QUERY could be killed also
-            /// Probably interpreting KILL QUERIES as complete (not internal) queries is extra functionality
-            if (is_cancelled)
+            if (isCancelled())
                 break;
 
             /// Sleep if there are unprocessed queries
@@ -162,9 +161,9 @@ public:
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
         /// Don't produce empty block
-        } while (res.rows() == 0);
+        } while (columns.empty() || columns[0]->empty());
 
-        return res;
+        return res_sample_block.cloneWithColumns(std::move(columns));
     }
 
     ProcessList & process_list;
@@ -179,6 +178,9 @@ BlockIO InterpreterKillQueryQuery::execute()
 {
     ASTKillQueryQuery & query = typeid_cast<ASTKillQueryQuery &>(*query_ptr);
 
+    if (!query.cluster.empty())
+        return executeDDLQueryOnCluster(query_ptr, context, {"system"});
+
     BlockIO res_io;
     Block processes_block = getSelectFromSystemProcessesResult();
     if (!processes_block)
@@ -187,25 +189,31 @@ BlockIO InterpreterKillQueryQuery::execute()
     ProcessList & process_list = context.getProcessList();
     QueryDescriptors queries_to_stop = extractQueriesExceptMeAndCheckAccess(processes_block, context);
 
-    res_io.in_sample = processes_block.cloneEmpty();
-    res_io.in_sample.insert(0, {std::make_shared<ColumnString>(), std::make_shared<DataTypeString>(), "kill_status"});
+    auto header = processes_block.cloneEmpty();
+    header.insert(0, {ColumnString::create(), std::make_shared<DataTypeString>(), "kill_status"});
 
     if (!query.sync || query.test)
     {
-        Block res = res_io.in_sample.cloneEmpty();
+        MutableColumns res_columns = header.cloneEmptyColumns();
 
         for (const auto & query_desc : queries_to_stop)
         {
-            auto code = (query.test) ? CancellationCode::Unknown : process_list.sendCancelToQuery(query_desc.query_id, query_desc.user);
-            insertResultRow(query_desc.source_num, code, processes_block, res);
+            auto code = (query.test) ? CancellationCode::Unknown : process_list.sendCancelToQuery(query_desc.query_id, query_desc.user, true);
+
+            /// Raise exception if this query is immortal, user have to know
+            /// This could happen only if query generate streams that don't implement IProfilingBlockInputStream
+            if (code == CancellationCode::CancelCannotBeSent)
+                throw Exception("Can't kill query '" + query_desc.query_id + "' it consits of unkillable stages", ErrorCodes::CANNOT_KILL);
+
+            insertResultRow(query_desc.source_num, code, processes_block, header, res_columns);
         }
 
-        res_io.in = std::make_shared<OneBlockInputStream>(res);
+        res_io.in = std::make_shared<OneBlockInputStream>(header.cloneWithColumns(std::move(res_columns)));
     }
     else
     {
         res_io.in = std::make_shared<SyncKillQueryInputStream>(
-            process_list, std::move(queries_to_stop), std::move(processes_block), res_io.in_sample);
+            process_list, std::move(queries_to_stop), std::move(processes_block), header);
     }
 
     return res_io;
@@ -213,8 +221,11 @@ BlockIO InterpreterKillQueryQuery::execute()
 
 Block InterpreterKillQueryQuery::getSelectFromSystemProcessesResult()
 {
-    String system_processes_query = "SELECT query_id, user, query FROM system.processes WHERE "
-        + queryToString(static_cast<ASTKillQueryQuery &>(*query_ptr).where_expression);
+    String system_processes_query = "SELECT query_id, user, query FROM system.processes";
+    auto & where_expression = static_cast<ASTKillQueryQuery &>(*query_ptr).where_expression;
+    if (where_expression)
+        system_processes_query += " WHERE " + queryToString(where_expression);
+
 
     BlockIO system_processes_io = executeQuery(system_processes_query, context, true);
     Block res = system_processes_io.in->read();

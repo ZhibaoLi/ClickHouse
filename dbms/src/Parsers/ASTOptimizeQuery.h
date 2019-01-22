@@ -1,7 +1,8 @@
 #pragma once
 
 #include <Parsers/IAST.h>
-
+#include <Parsers/ASTQueryWithTableAndOutput.h>
+#include <Parsers/ASTQueryWithOnCluster.h>
 
 namespace DB
 {
@@ -9,42 +10,41 @@ namespace DB
 
 /** OPTIMIZE query
   */
-class ASTOptimizeQuery : public IAST
+class ASTOptimizeQuery : public ASTQueryWithTableAndOutput, public ASTQueryWithOnCluster
 {
 public:
-    String database;
-    String table;
-
     /// The partition to optimize can be specified.
-    String partition;
+    ASTPtr partition;
     /// A flag can be specified - perform optimization "to the end" instead of one step.
     bool final;
     /// Do deduplicate (default: false)
     bool deduplicate;
 
-    ASTOptimizeQuery() = default;
-    ASTOptimizeQuery(const StringRange range_) : IAST(range_) {}
-
     /** Get the text that identifies this element. */
-    String getID() const override { return "OptimizeQuery_" + database + "_" + table + "_" + partition + (final ? "_final" : "") + (deduplicate ? "_deduplicate" : ""); };
-
-    ASTPtr clone() const override { return std::make_shared<ASTOptimizeQuery>(*this); }
-
-protected:
-    void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override
+    String getID(char delim) const override
     {
-        settings.ostr << (settings.hilite ? hilite_keyword : "") << "OPTIMIZE TABLE " << (settings.hilite ? hilite_none : "")
-            << (!database.empty() ? backQuoteIfNeed(database) + "." : "") << backQuoteIfNeed(table);
+        return "OptimizeQuery" + (delim + database) + delim + table + (final ? "_final" : "") + (deduplicate ? "_deduplicate" : "");
+    }
 
-        if (!partition.empty())
-            settings.ostr << (settings.hilite ? hilite_keyword : "") << " PARTITION " << (settings.hilite ? hilite_none : "")
-                << partition;
+    ASTPtr clone() const override
+    {
+        auto res = std::make_shared<ASTOptimizeQuery>(*this);
+        res->children.clear();
 
-        if (final)
-            settings.ostr << (settings.hilite ? hilite_keyword : "") << " FINAL" << (settings.hilite ? hilite_none : "");
+        if (partition)
+        {
+            res->partition = partition->clone();
+            res->children.push_back(res->partition);
+        }
 
-        if (deduplicate)
-            settings.ostr << (settings.hilite ? hilite_keyword : "") << " DEDUPLICATE" << (settings.hilite ? hilite_none : "");
+        return res;
+    }
+
+    void formatQueryImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override;
+
+    ASTPtr getRewrittenASTWithoutOnCluster(const std::string &new_database) const override
+    {
+        return removeOnCluster<ASTOptimizeQuery>(clone(), new_database);
     }
 };
 

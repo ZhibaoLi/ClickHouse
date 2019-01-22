@@ -1,20 +1,15 @@
 #include <DataStreams/LimitByBlockInputStream.h>
+#include <Common/SipHash.h>
+
 
 namespace DB
 {
 
-LimitByBlockInputStream::LimitByBlockInputStream(BlockInputStreamPtr input_, size_t group_size_, Names columns_)
-    : columns_names(columns_)
+LimitByBlockInputStream::LimitByBlockInputStream(const BlockInputStreamPtr & input, size_t group_size_, const Names & columns)
+    : columns_names(columns)
     , group_size(group_size_)
 {
-    children.push_back(input_);
-}
-
-String LimitByBlockInputStream::getID() const
-{
-    std::stringstream res;
-    res << "LimitBy(" << this << ")";
-    return res.str();
+    children.push_back(input);
 }
 
 Block LimitByBlockInputStream::readImpl()
@@ -27,7 +22,7 @@ Block LimitByBlockInputStream::readImpl()
         if (!block)
             return Block();
 
-        const ConstColumnPlainPtrs column_ptrs(getKeyColumns(block));
+        const ColumnRawPtrs column_ptrs(getKeyColumns(block));
         const size_t rows = block.rows();
         IColumn::Filter filter(rows);
         size_t inserted_count = 0;
@@ -40,7 +35,7 @@ Block LimitByBlockInputStream::readImpl()
             for (auto & column : column_ptrs)
                 column->updateHashWithValue(i, hash);
 
-            hash.get128(key.first, key.second);
+            hash.get128(key.low, key.high);
 
             if (keys_counts[key]++ < group_size)
             {
@@ -63,9 +58,9 @@ Block LimitByBlockInputStream::readImpl()
     }
 }
 
-ConstColumnPlainPtrs LimitByBlockInputStream::getKeyColumns(Block & block) const
+ColumnRawPtrs LimitByBlockInputStream::getKeyColumns(Block & block) const
 {
-    ConstColumnPlainPtrs column_ptrs;
+    ColumnRawPtrs column_ptrs;
     column_ptrs.reserve(columns_names.size());
 
     for (const auto & name : columns_names)
@@ -73,7 +68,7 @@ ConstColumnPlainPtrs LimitByBlockInputStream::getKeyColumns(Block & block) const
         auto & column = block.getByName(name).column;
 
         /// Ignore all constant columns.
-        if (!column->isConst())
+        if (!column->isColumnConst())
             column_ptrs.emplace_back(column.get());
     }
 

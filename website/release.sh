@@ -12,10 +12,11 @@ fi
 FULL_NAME="${IMAGE}:${TAG}"
 REMOTE_NAME="registry.yandex.net/${FULL_NAME}"
 DOCKER_HASH="$2"
+GULP="$BASE_DIR/node_modules/gulp/bin/gulp.js"
 if [[ -z "$1" ]]
 then
-    gulp clean
-    gulp build
+    $GULP clean
+    $GULP build
     docker build -t "${FULL_NAME}" "${BASE_DIR}"
     docker tag "${FULL_NAME}" "${REMOTE_NAME}"
     DOCKER_HASH=$(docker push "${REMOTE_NAME}" | tail -1 | awk '{print $3;}')

@@ -4,6 +4,7 @@
 #include <list>
 #include <string>
 #include <set>
+#include <initializer_list>
 
 #include <DataTypes/IDataType.h>
 #include <Core/Names.h>
@@ -27,7 +28,7 @@ struct NameAndTypePair
 
     bool operator==(const NameAndTypePair & rhs) const
     {
-        return name == rhs.name && type->getName() == rhs.type->getName();
+        return name == rhs.name && type->equals(*rhs.type);
     }
 };
 
@@ -36,7 +37,13 @@ using NamesAndTypes = std::vector<NameAndTypePair>;
 class NamesAndTypesList : public std::list<NameAndTypePair>
 {
 public:
-    using std::list<NameAndTypePair>::list;
+    NamesAndTypesList() {}
+
+    NamesAndTypesList(std::initializer_list<NameAndTypePair> init) : std::list<NameAndTypePair>(init) {}
+
+    template <typename Iterator>
+    NamesAndTypesList(Iterator begin, Iterator end) : std::list<NameAndTypePair>(begin, end) {}
+
 
     void readText(ReadBuffer & buf);
     void writeText(WriteBuffer & buf) const;
@@ -51,7 +58,11 @@ public:
     ///  (in other words, the added and deleted columns are counted once, the columns that changed the type - twice).
     size_t sizeOfDifference(const NamesAndTypesList & rhs) const;
 
+    /// If an element changes type, it is present both in deleted (with the old type) and in added (with the new type).
+    void getDifference(const NamesAndTypesList & rhs, NamesAndTypesList & deleted, NamesAndTypesList & added) const;
+
     Names getNames() const;
+    DataTypes getTypes() const;
 
     /// Leave only the columns whose names are in the `names`. In `names` there can be superfluous columns.
     NamesAndTypesList filter(const NameSet & names) const;
@@ -61,8 +72,8 @@ public:
 
     /// Unlike `filter`, returns columns in the order in which they go in `names`.
     NamesAndTypesList addTypes(const Names & names) const;
-};
 
-using NamesAndTypesListPtr = std::shared_ptr<NamesAndTypesList>;
+    bool contains(const String & name) const;
+};
 
 }

@@ -20,7 +20,7 @@ using BlockOutputStreamPtr = std::shared_ptr<IBlockOutputStream>;
 class NullAndDoCopyBlockInputStream : public IProfilingBlockInputStream
 {
 public:
-    NullAndDoCopyBlockInputStream(BlockInputStreamPtr input_, BlockOutputStreamPtr output_)
+    NullAndDoCopyBlockInputStream(const BlockInputStreamPtr & input_, BlockOutputStreamPtr output_)
         : input(input_), output(output_)
     {
         children.push_back(input_);
@@ -28,12 +28,7 @@ public:
 
     String getName() const override { return "NullAndDoCopy"; }
 
-    String getID() const override
-    {
-        std::stringstream res;
-        res << "copy from " << input->getID();
-        return res.str();
-    }
+    Block getHeader() const override { return {}; }
 
 protected:
     Block readImpl() override

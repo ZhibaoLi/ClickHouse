@@ -1,4 +1,3 @@
-#include <errno.h>
 #include <string.h>
 #include <cxxabi.h>
 
@@ -11,6 +10,7 @@
 #include <IO/ReadBufferFromString.h>
 
 #include <Common/Exception.h>
+#include <common/demangle.h>
 
 
 namespace DB
@@ -25,12 +25,11 @@ namespace ErrorCodes
 }
 
 
-void throwFromErrno(const std::string & s, int code, int e)
+std::string errnoToString(int code, int e)
 {
     const size_t buf_size = 128;
     char buf[buf_size];
 #ifndef _GNU_SOURCE
-    const char * unknown_message = "Unknown error ";
     int rc = strerror_r(e, buf, buf_size);
 #ifdef __APPLE__
     if (rc != 0 && rc != EINVAL)
@@ -40,23 +39,20 @@ void throwFromErrno(const std::string & s, int code, int e)
     {
         std::string tmp = std::to_string(code);
         const char * code = tmp.c_str();
+        const char * unknown_message = "Unknown error ";
         strcpy(buf, unknown_message);
         strcpy(buf + strlen(unknown_message), code);
     }
-    throw ErrnoException(s + ", errno: " + toString(e) + ", strerror: " + std::string(buf), code, e);
+    return "errno: " + toString(e) + ", strerror: " + std::string(buf);
 #else
-    throw ErrnoException(s + ", errno: " + toString(e) + ", strerror: " + std::string(strerror_r(e, buf, sizeof(buf))), code, e);
+    (void)code;
+    return "errno: " + toString(e) + ", strerror: " + std::string(strerror_r(e, buf, sizeof(buf)));
 #endif
 }
 
-
-inline std::string demangle(const char * const mangled, int & status)
+void throwFromErrno(const std::string & s, int code, int e)
 {
-    const auto demangled_str = abi::__cxa_demangle(mangled, 0, 0, &status);
-    std::string demangled{demangled_str};
-    free(demangled_str);
-
-    return demangled;
+    throw ErrnoException(s + ", " + errnoToString(code, e), code, e);
 }
 
 void tryLogCurrentException(const char * log_name, const std::string & start_of_message)
@@ -139,11 +135,11 @@ int getCurrentExceptionCode()
     {
         return e.code();
     }
-    catch (const Poco::Exception & e)
+    catch (const Poco::Exception &)
     {
         return ErrorCodes::POCO_EXCEPTION;
     }
-    catch (const std::exception & e)
+    catch (const std::exception &)
     {
         return ErrorCodes::STD_EXCEPTION;
     }
@@ -166,7 +162,7 @@ void tryLogException(std::exception_ptr e, const char * log_name, const std::str
 {
     try
     {
-        std::rethrow_exception(e);
+        std::rethrow_exception(std::move(e));
     }
     catch (...)
     {
@@ -178,7 +174,7 @@ void tryLogException(std::exception_ptr e, Poco::Logger * logger, const std::str
 {
     try
     {
-        std::rethrow_exception(e);
+        std::rethrow_exception(std::move(e));
     }
     catch (...)
     {
@@ -220,7 +216,7 @@ std::string getExceptionMessage(std::exception_ptr e, bool with_stacktrace)
 {
     try
     {
-        std::rethrow_exception(e);
+        std::rethrow_exception(std::move(e));
     }
     catch (...)
     {
@@ -231,12 +227,9 @@ std::string getExceptionMessage(std::exception_ptr e, bool with_stacktrace)
 
 std::string ExecutionStatus::serializeText() const
 {
-    std::string res;
-    {
-        WriteBufferFromString wb(res);
-        wb << code << "\n" << escape << message;
-    }
-    return res;
+    WriteBufferFromOwnString wb;
+    wb << code << "\n" << escape << message;
+    return wb.str();
 }
 
 void ExecutionStatus::deserializeText(const std::string & data)
@@ -245,9 +238,24 @@ void ExecutionStatus::deserializeText(const std::string & data)
     rb >> code >> "\n" >> escape >> message;
 }
 
+bool ExecutionStatus::tryDeserializeText(const std::string & data)
+{
+    try
+    {
+        deserializeText(data);
+    }
+    catch (...)
+    {
+        return false;
+    }
+
+    return true;
+}
+
 ExecutionStatus ExecutionStatus::fromCurrentException(const std::string & start_of_message)
 {
-    return ExecutionStatus(getCurrentExceptionCode(), start_of_message + ": " + getCurrentExceptionMessage(false, true));
+    String msg = (start_of_message.empty() ? "" : (start_of_message + ": ")) + getCurrentExceptionMessage(false, true);
+    return ExecutionStatus(getCurrentExceptionCode(), msg);
 }
 
 

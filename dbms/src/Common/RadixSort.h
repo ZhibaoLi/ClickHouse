@@ -33,7 +33,7 @@ struct RadixSortMallocAllocator
         return malloc(size);
     }
 
-    void deallocate(void * ptr, size_t size)
+    void deallocate(void * ptr, size_t /*size*/)
     {
         return free(ptr);
     }
@@ -54,7 +54,7 @@ struct RadixSortFloatTransform
 
     static KeyBits forward(KeyBits x)
     {
-        return x ^ (-((x >> (sizeof(KeyBits) * 8 - 1) | (KeyBits(1) << (sizeof(KeyBits) * 8 - 1)))));
+        return x ^ ((-(x >> (sizeof(KeyBits) * 8 - 1))) | (KeyBits(1) << (sizeof(KeyBits) * 8 - 1)));
     }
 
     static KeyBits backward(KeyBits x)
@@ -72,7 +72,7 @@ struct RadixSortFloatTraits
     using CountType = uint32_t;   /// Type for calculating histograms. In the case of a known small number of elements, it can be less than size_t.
 
     /// The type to which the key is transformed to do bit operations. This UInt is the same size as the key.
-    using KeyBits = typename std::conditional<sizeof(Float) == 8, uint64_t, uint32_t>::type;
+    using KeyBits = std::conditional_t<sizeof(Float) == 8, uint64_t, uint32_t>;
 
     static constexpr size_t PART_SIZE_BITS = 8;    /// With what pieces of the key, in bits, to do one pass - reshuffle of the array.
 
@@ -132,7 +132,7 @@ struct RadixSortIntTraits
     using Element = Int;
     using Key = Int;
     using CountType = uint32_t;
-    using KeyBits = typename std::make_unsigned<Int>::type;
+    using KeyBits = std::make_unsigned_t<Int>;
 
     static constexpr size_t PART_SIZE_BITS = 8;
 
@@ -185,6 +185,7 @@ public:
         Element * swap_buffer = reinterpret_cast<Element *>(allocator.allocate(size * sizeof(Element)));
 
         /// Transform the array and calculate the histogram.
+        /// NOTE This is slightly suboptimal. Look at https://github.com/powturbo/TurboHist
         for (size_t i = 0; i < size; ++i)
         {
             if (!Traits::Transform::transform_is_simple)
@@ -240,21 +241,21 @@ public:
 
 
 template <typename T>
-typename std::enable_if<std::is_unsigned<T>::value && std::is_integral<T>::value, void>::type
+std::enable_if_t<std::is_unsigned_v<T> && std::is_integral_v<T>, void>
 radixSort(T * arr, size_t size)
 {
     return RadixSort<RadixSortUIntTraits<T>>::execute(arr, size);
 }
 
 template <typename T>
-typename std::enable_if<std::is_signed<T>::value && std::is_integral<T>::value, void>::type
+std::enable_if_t<std::is_signed_v<T> && std::is_integral_v<T>, void>
 radixSort(T * arr, size_t size)
 {
     return RadixSort<RadixSortIntTraits<T>>::execute(arr, size);
 }
 
 template <typename T>
-typename std::enable_if<std::is_floating_point<T>::value, void>::type
+std::enable_if_t<std::is_floating_point_v<T>, void>
 radixSort(T * arr, size_t size)
 {
     return RadixSort<RadixSortFloatTraits<T>>::execute(arr, size);

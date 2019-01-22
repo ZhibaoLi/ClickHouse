@@ -1,7 +1,6 @@
 #pragma once
 
 #include <DataStreams/IProfilingBlockInputStream.h>
-#include <Columns/ColumnConst.h>
 #include <iostream>
 
 namespace DB
@@ -14,25 +13,25 @@ class FilterColumnsBlockInputStream : public IProfilingBlockInputStream
 {
 public:
     FilterColumnsBlockInputStream(
-        BlockInputStreamPtr input_,
-        const Names & columns_to_save_)
-        : columns_to_save(columns_to_save_)
+        const BlockInputStreamPtr & input, const Names & columns_to_save_, bool throw_if_column_not_found_)
+        : columns_to_save(columns_to_save_), throw_if_column_not_found(throw_if_column_not_found_)
     {
-        children.push_back(input_);
+        children.push_back(input);
     }
 
     String getName() const override
     {
-        return "FilterColumnsBlockInputStream";
+        return "FilterColumns";
     }
 
-    String getID() const override;
+    Block getHeader() const override;
 
 protected:
     Block readImpl() override;
 
 private:
     Names columns_to_save;
+    bool throw_if_column_not_found;
 };
 
 }

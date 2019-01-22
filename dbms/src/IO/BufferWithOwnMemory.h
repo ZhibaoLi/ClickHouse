@@ -26,7 +26,10 @@ namespace DB
   */
 struct Memory : boost::noncopyable, Allocator<false>
 {
-    size_t m_capacity = 0;
+    /// Padding is needed to allow usage of 'memcpySmallAllowReadWriteOverflow15' function with this buffer.
+    static constexpr size_t pad_right = 15;
+
+    size_t m_capacity = 0;  /// With padding.
     size_t m_size = 0;
     char * m_data = nullptr;
     size_t alignment = 0;
@@ -44,12 +47,12 @@ struct Memory : boost::noncopyable, Allocator<false>
         dealloc();
     }
 
-    Memory(Memory && rhs)
+    Memory(Memory && rhs) noexcept
     {
         *this = std::move(rhs);
     }
 
-    Memory & operator=(Memory && rhs)
+    Memory & operator=(Memory && rhs) noexcept
     {
         std::swap(m_capacity, rhs.m_capacity);
         std::swap(m_size, rhs.m_size);
@@ -69,23 +72,25 @@ struct Memory : boost::noncopyable, Allocator<false>
     {
         if (0 == m_capacity)
         {
-            m_size = m_capacity = new_size;
+            m_size = new_size;
+            m_capacity = new_size;
             alloc();
         }
-        else if (new_size < m_capacity)
+        else if (new_size <= m_size)
         {
             m_size = new_size;
             return;
         }
         else
         {
-            new_size = align(new_size, alignment);
-            m_data = static_cast<char *>(Allocator::realloc(m_data, m_capacity, new_size, alignment));
-            m_capacity = new_size;
-            m_size = m_capacity;
+            size_t new_capacity = align(new_size + pad_right, alignment);
+            m_data = static_cast<char *>(Allocator::realloc(m_data, m_capacity, new_capacity, alignment));
+            m_capacity = new_capacity;
+            m_size = m_capacity - pad_right;
         }
     }
 
+private:
     static size_t align(const size_t value, const size_t alignment)
     {
         if (!alignment)
@@ -94,7 +99,6 @@ struct Memory : boost::noncopyable, Allocator<false>
         return (value + alignment - 1) / alignment * alignment;
     }
 
-private:
     void alloc()
     {
         if (!m_capacity)
@@ -103,13 +107,15 @@ private:
             return;
         }
 
-        ProfileEvents::increment(ProfileEvents::IOBufferAllocs);
-        ProfileEvents::increment(ProfileEvents::IOBufferAllocBytes, m_capacity);
+        size_t padded_capacity = m_capacity + pad_right;
 
-        size_t new_capacity = align(m_capacity, alignment);
+        ProfileEvents::increment(ProfileEvents::IOBufferAllocs);
+        ProfileEvents::increment(ProfileEvents::IOBufferAllocBytes, padded_capacity);
+
+        size_t new_capacity = align(padded_capacity, alignment);
         m_data = static_cast<char *>(Allocator::alloc(new_capacity, alignment));
         m_capacity = new_capacity;
-        m_size = m_capacity;
+        m_size = m_capacity - pad_right;
     }
 
     void dealloc()
@@ -137,6 +143,7 @@ public:
         : Base(nullptr, 0), memory(existing_memory ? 0 : size, alignment)
     {
         Base::set(existing_memory ? existing_memory : memory.data(), size);
+        Base::padded = !existing_memory;
     }
 };
 

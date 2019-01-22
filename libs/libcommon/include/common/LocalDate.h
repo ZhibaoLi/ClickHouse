@@ -7,17 +7,18 @@
 #include <common/DateLUT.h>
 
 
-/** Хранит дату в broken-down виде.
-  * Может быть инициализирован из даты в текстовом виде '2011-01-01' и из time_t.
-  * Может быть инициализирован из даты в текстовом виде '20110101... (используются первые 8 символов)
-  * Неявно преобразуется в time_t.
-  * Сериализуется в ostream в текстовом виде.
-  * Внимание: преобразование в unix timestamp и обратно производится в текущей тайм-зоне!
-  * При переводе стрелок назад, возникает неоднозначность - преобразование производится в меньшее значение.
+/** Stores a calendar date in broken-down form (year, month, day-in-month).
+  * Could be initialized from date in text form, like '2011-01-01' or from time_t with rounding to date.
+  * Also could be initialized from date in text form like '20110101... (only first 8 symbols are used).
+  * Could be implicitly casted to time_t.
+  * NOTE: Transforming between time_t and LocalDate is done in local time zone!
   *
-  * packed - для memcmp (из-за того, что m_year - 2 байта, little endian, работает корректно только до 2047 года)
+  * When local time was shifted backwards (due to daylight saving time or whatever reason)
+  *  - then to resolve the ambiguity of transforming to time_t, lowest of two possible values is selected.
+  *
+  * packed - for memcmp to work naturally (but because m_year is 2 bytes, on little endian, comparison is correct only before year 2047)
   */
-class __attribute__ ((__packed__)) LocalDate
+class LocalDate
 {
 private:
     unsigned short m_year;
@@ -61,12 +62,12 @@ public:
         init(time);
     }
 
-    LocalDate(DayNum_t day_num)
+    LocalDate(DayNum day_num)
     {
         const auto & values = DateLUT::instance().getValues(day_num);
-        m_year     = values.year;
+        m_year  = values.year;
         m_month = values.month;
-        m_day     = values.day_of_month;
+        m_day   = values.day_of_month;
     }
 
     LocalDate(unsigned short year_, unsigned char month_, unsigned char day_)
@@ -88,19 +89,8 @@ public:
     {
     }
 
-    LocalDate(const LocalDate & x)
-    {
-        operator=(x);
-    }
-
-    LocalDate & operator= (const LocalDate & x)
-    {
-        m_year = x.m_year;
-        m_month = x.m_month;
-        m_day = x.m_day;
-
-        return *this;
-    }
+    LocalDate(const LocalDate &) noexcept = default;
+    LocalDate & operator= (const LocalDate &) noexcept = default;
 
     LocalDate & operator= (time_t time)
     {
@@ -113,12 +103,12 @@ public:
         return DateLUT::instance().makeDate(m_year, m_month, m_day);
     }
 
-    DayNum_t getDayNum() const
+    DayNum getDayNum() const
     {
         return DateLUT::instance().makeDayNum(m_year, m_month, m_day);
     }
 
-    operator DayNum_t() const
+    operator DayNum() const
     {
         return getDayNum();
     }
@@ -161,7 +151,7 @@ public:
         return !(*this == other);
     }
 
-    /// NOTE Неэффективно.
+    /// NOTE Inefficient.
     std::string toString(char separator = '-') const
     {
         std::stringstream ss;
@@ -174,6 +164,9 @@ public:
         return ss.str();
     }
 };
+
+static_assert(sizeof(LocalDate) == 4);
+
 
 inline std::ostream & operator<< (std::ostream & ostr, const LocalDate & date)
 {

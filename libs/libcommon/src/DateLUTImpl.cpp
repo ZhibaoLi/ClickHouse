@@ -1,5 +1,14 @@
-#include <civil_time.h>
+#if __has_include(<cctz/civil_time.h>)
+#include <cctz/civil_time.h> // bundled, debian
+#else
+#include <civil_time.h> // freebsd
+#endif
+
+#if __has_include(<cctz/time_zone.h>)
+#include <cctz/time_zone.h>
+#else
 #include <time_zone.h>
+#endif
 
 #include <common/DateLUTImpl.h>
 #include <Poco/Exception.h>
@@ -8,6 +17,8 @@
 #include <chrono>
 #include <cstring>
 #include <iostream>
+
+#define DATE_LUT_MIN 0
 
 
 namespace
@@ -45,6 +56,7 @@ DateLUTImpl::DateLUTImpl(const std::string & time_zone_)
 
     cctz::time_zone::absolute_lookup start_of_epoch_lookup = cctz_time_zone.lookup(std::chrono::system_clock::from_time_t(start_of_day));
     offset_at_start_of_epoch = start_of_epoch_lookup.offset;
+    offset_is_whole_number_of_hours_everytime = true;
 
     cctz::civil_day date{1970, 1, 1};
 
@@ -52,7 +64,7 @@ DateLUTImpl::DateLUTImpl(const std::string & time_zone_)
     {
         cctz::time_zone::civil_lookup lookup = cctz_time_zone.lookup(date);
 
-        start_of_day = std::chrono::system_clock::to_time_t(lookup.pre);    /// Ambiguouty is possible.
+        start_of_day = std::chrono::system_clock::to_time_t(lookup.pre);    /// Ambiguity is possible.
 
         Values & values = lut[i];
         values.year = date.year();
@@ -61,8 +73,19 @@ DateLUTImpl::DateLUTImpl(const std::string & time_zone_)
         values.day_of_week = getDayOfWeek(date);
         values.date = start_of_day;
 
+        if (values.day_of_month == 1)
+        {
+            cctz::civil_month month(date);
+            values.days_in_month = cctz::civil_day(month + 1) - cctz::civil_day(month);
+        }
+        else
+            values.days_in_month = i != 0 ? lut[i - 1].days_in_month : 31;
+
         values.time_at_offset_change = 0;
         values.amount_of_offset_change = 0;
+
+        if (start_of_day % 3600)
+            offset_is_whole_number_of_hours_everytime = false;
 
         /// If UTC offset was changed in previous day.
         if (i != 0)
@@ -78,7 +101,7 @@ DateLUTImpl::DateLUTImpl(const std::string & time_zone_)
                 ///  when UTC offset was changed. Search is performed with 15-minute granularity, assuming it is enough.
 
                 time_t time_at_offset_change = 900;
-                while (time_at_offset_change < 65536)
+                while (time_at_offset_change < 86400)
                 {
                     auto utc_offset_at_current_time = cctz_time_zone.lookup(std::chrono::system_clock::from_time_t(
                         lut[i - 1].date + time_at_offset_change)).offset;
@@ -89,10 +112,11 @@ DateLUTImpl::DateLUTImpl(const std::string & time_zone_)
                     time_at_offset_change += 900;
                 }
 
-                lut[i - 1].time_at_offset_change = time_at_offset_change >= 65536 ? 0 : time_at_offset_change;
+                lut[i - 1].time_at_offset_change = time_at_offset_change;
 
-/*                std::cerr << lut[i - 1].year << "-" << int(lut[i - 1].month) << "-" << int(lut[i - 1].day_of_month)
-                    << " offset was changed at " << lut[i - 1].time_at_offset_change << " for " << lut[i - 1].amount_of_offset_change << " seconds.\n";*/
+                /// We doesn't support cases when time change results in switching to previous day.
+                if (static_cast<int>(lut[i - 1].time_at_offset_change) + static_cast<int>(lut[i - 1].amount_of_offset_change) < 0)
+                    lut[i - 1].time_at_offset_change = -lut[i - 1].amount_of_offset_change;
             }
         }
 
@@ -102,11 +126,23 @@ DateLUTImpl::DateLUTImpl(const std::string & time_zone_)
     }
     while (start_of_day <= DATE_LUT_MAX && i <= DATE_LUT_MAX_DAY_NUM);
 
-    /// Заполняем lookup таблицу для годов
-    ::memset(years_lut, 0, DATE_LUT_YEARS * sizeof(years_lut[0]));
-    for (size_t day = 0; day < i && lut[day].year <= DATE_LUT_MAX_YEAR; ++day)
+    /// Fill excessive part of lookup table. This is needed only to simplify handling of overflow cases.
+    while (i < DATE_LUT_SIZE)
     {
-        if (lut[day].month == 1 && lut[day].day_of_month == 1)
-            years_lut[lut[day].year - DATE_LUT_MIN_YEAR] = day;
+        lut[i] = lut[DATE_LUT_MAX_DAY_NUM];
+        ++i;
+    }
+
+    /// Fill lookup table for years and months.
+    for (size_t day = 0; day < DATE_LUT_SIZE && lut[day].year <= DATE_LUT_MAX_YEAR; ++day)
+    {
+        const Values & values = lut[day];
+
+        if (values.day_of_month == 1)
+        {
+            if (values.month == 1)
+                years_lut[values.year - DATE_LUT_MIN_YEAR] = day;
+            years_months_lut[(values.year - DATE_LUT_MIN_YEAR) * 12 + values.month - 1] = day;
+        }
     }
 }

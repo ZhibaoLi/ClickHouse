@@ -1,35 +1,31 @@
 #pragma once
 
 #include <DataTypes/IDataType.h>
+#include <DataTypes/DataTypeWithSimpleSerialization.h>
 
 
 namespace DB
 {
 
-/** Implements part of the IDataType interface, common to all numbers
-  * - input and output in text form.
+/** Implements part of the IDataType interface, common to all numbers and for Date and DateTime.
   */
 template <typename T>
-class DataTypeNumberBase : public IDataType
+class DataTypeNumberBase : public DataTypeWithSimpleSerialization
 {
+    static_assert(IsNumber<T>);
+
 public:
+    static constexpr bool is_parametric = false;
     using FieldType = T;
 
-    std::string getName() const override { return TypeName<T>::get(); }
+    const char * getFamilyName() const override { return TypeName<T>::get(); }
+    TypeIndex getTypeId() const override { return TypeId<T>::value; }
 
-    bool isNumeric() const override { return true; }
-    bool behavesAsNumber() const override { return true; }
-
-    void serializeText(const IColumn & column, size_t row_num, WriteBuffer & ostr) const override;
-    void serializeTextEscaped(const IColumn & column, size_t row_num, WriteBuffer & ostr) const override;
-    void deserializeTextEscaped(IColumn & column, ReadBuffer & istr) const override;
-    void serializeTextQuoted(const IColumn & column, size_t row_num, WriteBuffer & ostr) const override;
-    void deserializeTextQuoted(IColumn & column, ReadBuffer & istr) const override;
-    void serializeTextJSON(const IColumn & column, size_t row_num, WriteBuffer & ostr, bool) const override;
-    void deserializeTextJSON(IColumn & column, ReadBuffer & istr) const override;
-    void serializeTextCSV(const IColumn & column, size_t row_num, WriteBuffer & ostr) const override;
-    void deserializeTextCSV(IColumn & column, ReadBuffer & istr, const char delimiter) const override;
-    size_t getSizeOfField() const override { return sizeof(FieldType); }
+    void serializeText(const IColumn & column, size_t row_num, WriteBuffer & ostr, const FormatSettings &) const override;
+    void deserializeText(IColumn & column, ReadBuffer & istr, const FormatSettings & settings) const override;
+    void serializeTextJSON(const IColumn & column, size_t row_num, WriteBuffer & ostr, const FormatSettings & settings) const override;
+    void deserializeTextJSON(IColumn & column, ReadBuffer & istr, const FormatSettings &) const override;
+    void deserializeTextCSV(IColumn & column, ReadBuffer & istr, const FormatSettings & settings) const override;
     Field getDefault() const override;
 
     /** Format is platform-dependent. */
@@ -41,8 +37,21 @@ public:
     void serializeBinaryBulk(const IColumn & column, WriteBuffer & ostr, size_t offset, size_t limit) const override;
     void deserializeBinaryBulk(IColumn & column, ReadBuffer & istr, size_t limit, double avg_value_size_hint) const override;
 
-    ColumnPtr createColumn() const override;
-    ColumnPtr createConstColumn(size_t size, const Field & field) const override;
+    MutableColumnPtr createColumn() const override;
+
+    bool isParametric() const override { return false; }
+    bool haveSubtypes() const override { return false; }
+    bool shouldAlignRightInPrettyFormats() const override { return true; }
+    bool textCanContainOnlyValidUTF8() const override { return true; }
+    bool isComparable() const override { return true; }
+    bool isValueRepresentedByNumber() const override { return true; }
+    bool isValueRepresentedByInteger() const override;
+    bool isValueRepresentedByUnsignedInteger() const override;
+    bool isValueUnambiguouslyRepresentedInContiguousMemoryRegion() const override { return true; }
+    bool haveMaximumSizeOfValue() const override { return true; }
+    size_t getSizeOfValueInMemory() const override { return sizeof(T); }
+    bool isCategorial() const override { return isValueRepresentedByInteger(); }
+    bool canBeInsideLowCardinality() const override { return true; }
 };
 
 }

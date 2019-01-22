@@ -7,16 +7,15 @@
 #include <common/LocalDate.h>
 
 
-/** Хранит дату и время в broken-down виде.
-  * Может быть инициализирован из даты и времени в текстовом виде '2011-01-01 00:00:00' и из time_t.
-  * Неявно преобразуется в time_t.
-  * Сериализуется в ostream в текстовом виде.
-  * Внимание: преобразование в unix timestamp и обратно производится в текущей тайм-зоне!
-  * При переводе стрелок назад, возникает неоднозначность - преобразование производится в меньшее значение.
+/** Stores calendar date and time in broken-down form.
+  * Could be initialized from date and time in text form like '2011-01-01 00:00:00' or from time_t.
+  * Could be implicitly casted to time_t.
+  * NOTE: Transforming between time_t and LocalDate is done in local time zone!
   *
-  * packed - для memcmp (из-за того, что m_year - 2 байта, little endian, работает корректно только до 2047 года)
+  * When local time was shifted backwards (due to daylight saving time or whatever reason)
+  *  - then to resolve the ambiguity of transforming to time_t, lowest of two possible values is selected.
   */
-class __attribute__ ((__packed__)) LocalDateTime
+class LocalDateTime
 {
 private:
     unsigned short m_year;
@@ -26,16 +25,20 @@ private:
     unsigned char m_minute;
     unsigned char m_second;
 
+    /// For struct to fill 8 bytes and for safe invocation of memcmp.
+    /// NOTE We may use attribute packed instead, but it is less portable.
+    unsigned char pad = 0;
+
     void init(time_t time)
     {
         if (unlikely(time > DATE_LUT_MAX || time == 0))
         {
-            m_year         = 0;
-            m_month     = 0;
-            m_day         = 0;
-            m_hour         = 0;
-            m_minute     = 0;
-            m_second     = 0;
+            m_year = 0;
+            m_month = 0;
+            m_day = 0;
+            m_hour = 0;
+            m_minute = 0;
+            m_second = 0;
 
             return;
         }
@@ -47,8 +50,10 @@ private:
         m_month = values.month;
         m_day = values.day_of_month;
         m_hour = date_lut.toHour(time);
-        m_minute = date_lut.toMinuteInaccurate(time);
-        m_second = date_lut.toSecondInaccurate(time);
+        m_minute = date_lut.toMinute(time);
+        m_second = date_lut.toSecond(time);
+
+        (void)pad;  /// Suppress unused private field warning.
     }
 
     void init(const char * s, size_t length)
@@ -63,6 +68,8 @@ private:
         m_hour = (s[11] - '0') * 10 + (s[12] - '0');
         m_minute = (s[14] - '0') * 10 + (s[15] - '0');
         m_second = (s[17] - '0') * 10 + (s[18] - '0');
+
+        (void)pad;
     }
 
 public:
@@ -94,22 +101,8 @@ public:
         init(data, length);
     }
 
-    LocalDateTime(const LocalDateTime & x)
-    {
-        operator=(x);
-    }
-
-    LocalDateTime & operator= (const LocalDateTime & x)
-    {
-        m_year = x.m_year;
-        m_month = x.m_month;
-        m_day = x.m_day;
-        m_hour = x.m_hour;
-        m_minute = x.m_minute;
-        m_second = x.m_second;
-
-        return *this;
-    }
+    LocalDateTime(const LocalDateTime &) noexcept = default;
+    LocalDateTime & operator= (const LocalDateTime &) noexcept = default;
 
     LocalDateTime & operator= (time_t time)
     {
@@ -124,19 +117,19 @@ public:
             : DateLUT::instance().makeDateTime(m_year, m_month, m_day, m_hour, m_minute, m_second);
     }
 
-    unsigned short year() const     { return m_year; }
-    unsigned char month() const     { return m_month; }
-    unsigned char day() const         { return m_day; }
-    unsigned char hour() const         { return m_hour; }
-    unsigned char minute() const     { return m_minute; }
-    unsigned char second() const     { return m_second; }
+    unsigned short year() const { return m_year; }
+    unsigned char month() const { return m_month; }
+    unsigned char day() const { return m_day; }
+    unsigned char hour() const { return m_hour; }
+    unsigned char minute() const { return m_minute; }
+    unsigned char second() const { return m_second; }
 
-    void year(unsigned short x)     { m_year = x; }
-    void month(unsigned char x)     { m_month = x; }
-    void day(unsigned char x)         { m_day = x; }
-    void hour(unsigned char x)         { m_hour = x; }
-    void minute(unsigned char x)     { m_minute = x; }
-    void second(unsigned char x)     { m_second = x; }
+    void year(unsigned short x) { m_year = x; }
+    void month(unsigned char x) { m_month = x; }
+    void day(unsigned char x) { m_day = x; }
+    void hour(unsigned char x) { m_hour = x; }
+    void minute(unsigned char x) { m_minute = x; }
+    void second(unsigned char x) { m_second = x; }
 
     LocalDate toDate() const { return LocalDate(m_year, m_month, m_day); }
 
@@ -173,15 +166,18 @@ public:
     }
 };
 
+static_assert(sizeof(LocalDateTime) == 8);
+
+
 inline std::ostream & operator<< (std::ostream & ostr, const LocalDateTime & datetime)
 {
     ostr << std::setfill('0') << std::setw(4) << datetime.year();
 
-    ostr << '-' << (datetime.month() / 10)     << (datetime.month() % 10)
-        << '-' << (datetime.day() / 10)     << (datetime.day() % 10)
-        << ' ' << (datetime.hour() / 10)     << (datetime.hour() % 10)
-        << ':' << (datetime.minute() / 10)     << (datetime.minute() % 10)
-        << ':' << (datetime.second() / 10)     << (datetime.second() % 10);
+    ostr << '-' << (datetime.month() / 10) << (datetime.month() % 10)
+        << '-' << (datetime.day() / 10) << (datetime.day() % 10)
+        << ' ' << (datetime.hour() / 10) << (datetime.hour() % 10)
+        << ':' << (datetime.minute() / 10) << (datetime.minute() % 10)
+        << ':' << (datetime.second() / 10) << (datetime.second() % 10);
 
     return ostr;
 }

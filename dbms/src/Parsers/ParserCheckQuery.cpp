@@ -4,51 +4,43 @@
 #include <Parsers/ExpressionElementParsers.h>
 #include <Parsers/ASTCheckQuery.h>
 
-#include <Common/typeid_cast.h>
-
 
 namespace DB
 {
 
-bool ParserCheckQuery::parseImpl(IParser::Pos & pos, IParser::Pos end, ASTPtr & node, Pos & max_parsed_pos, Expected & expected)
+bool ParserCheckQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
 {
-    ParserWhitespaceOrComments ws;
     ParserKeyword s_check_table("CHECK TABLE");
-    ParserString s_dot(".");
+    ParserToken s_dot(TokenType::Dot);
 
     ParserIdentifier table_parser;
 
     ASTPtr table;
     ASTPtr database;
 
-    auto query = std::make_shared<ASTCheckQuery>(StringRange(pos, end));
-
-    ws.ignore(pos, end);
-
-    if (!s_check_table.ignore(pos, end, max_parsed_pos, expected))
+    if (!s_check_table.ignore(pos, expected))
+        return false;
+    if (!table_parser.parse(pos, database, expected))
         return false;
 
-    ws.ignore(pos, end);
-    if (!table_parser.parse(pos, end, database, max_parsed_pos, expected))
-        return false;
-
-    if (s_dot.ignore(pos, end))
+    if (s_dot.ignore(pos))
     {
-        if (!table_parser.parse(pos, end, table, max_parsed_pos, expected))
+        if (!table_parser.parse(pos, table, expected))
             return false;
 
-        query->database = typeid_cast<const ASTIdentifier &>(*database).name;
-        query->table = typeid_cast<const ASTIdentifier &>(*table).name;
+        auto query = std::make_shared<ASTCheckQuery>();
+        getIdentifierName(database, query->database);
+        getIdentifierName(table, query->table);
+        node = query;
     }
     else
     {
         table = database;
-        query->table = typeid_cast<const ASTIdentifier &>(*table).name;
+        auto query = std::make_shared<ASTCheckQuery>();
+        getIdentifierName(table, query->table);
+        node = query;
     }
 
-    ws.ignore(pos, end);
-
-    node = query;
     return true;
 }
 

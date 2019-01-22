@@ -3,16 +3,16 @@
 namespace DB
 {
 
-String FilterColumnsBlockInputStream::getID() const
+Block FilterColumnsBlockInputStream::getHeader() const
 {
-    std::stringstream res;
-    res << "FilterColumnsBlockInputStream(" << children.back()->getID();
+    Block block = children.back()->getHeader();
+    Block filtered;
 
     for (const auto & it : columns_to_save)
-        res << ", " << it;
+        if (throw_if_column_not_found || block.has(it))
+            filtered.insert(std::move(block.getByName(it)));
 
-    res << ")";
-    return res.str();
+    return filtered;
 }
 
 Block FilterColumnsBlockInputStream::readImpl()
@@ -25,7 +25,8 @@ Block FilterColumnsBlockInputStream::readImpl()
     Block filtered;
 
     for (const auto & it : columns_to_save)
-        filtered.insert(std::move(block.getByName(it)));
+        if (throw_if_column_not_found || block.has(it))
+            filtered.insert(std::move(block.getByName(it)));
 
     return filtered;
 }

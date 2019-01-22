@@ -1,8 +1,5 @@
-#include <Columns/ColumnString.h>
-#include <Columns/ColumnsNumber.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypesNumber.h>
-#include <DataStreams/OneBlockInputStream.h>
 #include <Interpreters/Context.h>
 #include <Storages/System/StorageSystemSettings.h>
 
@@ -10,59 +7,31 @@
 namespace DB
 {
 
-
-StorageSystemSettings::StorageSystemSettings(const std::string & name_)
-    : name(name_)
-    , columns{
-        { "name",             std::make_shared<DataTypeString>()    },
-        { "value",            std::make_shared<DataTypeString>()    },
-        { "changed",         std::make_shared<DataTypeUInt8>()    },
-    }
+NamesAndTypesList StorageSystemSettings::getNamesAndTypes()
 {
+    return {
+        {"name", std::make_shared<DataTypeString>()},
+        {"value", std::make_shared<DataTypeString>()},
+        {"changed", std::make_shared<DataTypeUInt8>()},
+        {"description", std::make_shared<DataTypeString>()},
+    };
 }
 
+#ifndef __clang__
+#pragma GCC optimize("-fno-var-tracking-assignments")
+#endif
 
-BlockInputStreams StorageSystemSettings::read(
-    const Names & column_names,
-    const ASTPtr & query,
-    const Context & context,
-    QueryProcessingStage::Enum & processed_stage,
-    const size_t max_block_size,
-    const unsigned num_streams)
+void StorageSystemSettings::fillData(MutableColumns & res_columns, const Context & context, const SelectQueryInfo &) const
 {
-    check(column_names);
-    processed_stage = QueryProcessingStage::FetchColumns;
-
     const Settings & settings = context.getSettingsRef();
 
-    ColumnWithTypeAndName col_name{std::make_shared<ColumnString>(), std::make_shared<DataTypeString>(), "name"};
-    ColumnWithTypeAndName col_value{std::make_shared<ColumnString>(), std::make_shared<DataTypeString>(), "value"};
-    ColumnWithTypeAndName col_changed{std::make_shared<ColumnUInt8>(), std::make_shared<DataTypeUInt8>(), "changed"};
-
-#define ADD_SETTING(TYPE, NAME, DEFAULT) \
-    col_name.column->insert(String(#NAME)); \
-    col_value.column->insert(settings.NAME.toString()); \
-    col_changed.column->insert(UInt64(settings.NAME.changed));
-
+#define ADD_SETTING(TYPE, NAME, DEFAULT, DESCRIPTION)      \
+    res_columns[0]->insert(#NAME);                 \
+    res_columns[1]->insert(settings.NAME.toString());      \
+    res_columns[2]->insert(settings.NAME.changed); \
+    res_columns[3]->insert(DESCRIPTION);
     APPLY_FOR_SETTINGS(ADD_SETTING)
 #undef ADD_SETTING
-
-#define ADD_LIMIT(TYPE, NAME, DEFAULT) \
-    col_name.column->insert(String(#NAME)); \
-    col_value.column->insert(settings.limits.NAME.toString()); \
-    col_changed.column->insert(UInt64(settings.limits.NAME.changed));
-
-    APPLY_FOR_LIMITS(ADD_LIMIT)
-#undef ADD_LIMIT
-
-    Block block{
-        col_name,
-        col_value,
-        col_changed,
-    };
-
-    return BlockInputStreams(1, std::make_shared<OneBlockInputStream>(block));
 }
-
 
 }

@@ -1,16 +1,24 @@
 #include <Storages/System/StorageSystemGraphite.h>
 
-#include <Core/Field.h>
+#include <Common/StringUtils/StringUtils.h>
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnsNumber.h>
+#include <Core/Field.h>
 #include <DataStreams/OneBlockInputStream.h>
 #include <DataTypes/DataTypeString.h>
 #include <DataTypes/DataTypesNumber.h>
+#include <Interpreters/Context.h>
 
 #include <Poco/Util/Application.h>
 
+
 namespace DB
 {
+
+namespace ErrorCodes
+{
+    extern const int NO_ELEMENTS_IN_CONFIG;
+}
 
 namespace
 {
@@ -41,7 +49,11 @@ static Pattern readOnePattern(
 
     config.keys(path, keys);
 
-    for (const auto & key : keys) {
+    if (keys.empty())
+        throw Exception("Empty pattern in Graphite rollup configuration", ErrorCodes::NO_ELEMENTS_IN_CONFIG);
+
+    for (const auto & key : keys)
+    {
         const String key_path = path + "." + key;
 
         if (startsWith(key, "regexp"))
@@ -63,16 +75,18 @@ static Pattern readOnePattern(
     return pattern;
 }
 
-static std::vector<Pattern> readPatterns(const std::string & section)
+static std::vector<Pattern> readPatterns(
+    const AbstractConfiguration & config,
+    const std::string & section)
 {
-    const AbstractConfiguration & config = Application::instance().config();
     AbstractConfiguration::Keys keys;
     std::vector<Pattern> result;
     size_t count = 0;
 
     config.keys(section, keys);
 
-    for (const auto & key : keys) {
+    for (const auto & key : keys)
+    {
         if (startsWith(key, "pattern"))
         {
             Pattern pattern(readOnePattern(config, section + "." + key));
@@ -92,9 +106,8 @@ static std::vector<Pattern> readPatterns(const std::string & section)
     return result;
 }
 
-static Strings getAllGraphiteSections()
+static Strings getAllGraphiteSections(const AbstractConfiguration & config)
 {
-    const AbstractConfiguration & config = Application::instance().config();
     Strings result;
 
     AbstractConfiguration::Keys keys;
@@ -111,95 +124,42 @@ static Strings getAllGraphiteSections()
 
 } // namespace
 
-StorageSystemGraphite::StorageSystemGraphite(const std::string & name_)
-    : name(name_)
-    , columns {
+NamesAndTypesList StorageSystemGraphite::getNamesAndTypes()
+{
+    return {
         {"config_name", std::make_shared<DataTypeString>()},
         {"regexp",      std::make_shared<DataTypeString>()},
         {"function",    std::make_shared<DataTypeString>()},
         {"age",         std::make_shared<DataTypeUInt64>()},
         {"precision",   std::make_shared<DataTypeUInt64>()},
         {"priority",    std::make_shared<DataTypeUInt16>()},
-        {"is_default",  std::make_shared<DataTypeUInt8>()}}
-{
+        {"is_default",  std::make_shared<DataTypeUInt8>()},
+    };
 }
 
 
-BlockInputStreams StorageSystemGraphite::read(
-    const Names & column_names,
-    const ASTPtr & query,
-    const Context & context,
-    QueryProcessingStage::Enum & processed_stage,
-    size_t max_block_size,
-    unsigned num_streams)
+void StorageSystemGraphite::fillData(MutableColumns & res_columns, const Context & context, const SelectQueryInfo &) const
 {
-    check(column_names);
-    processed_stage = QueryProcessingStage::FetchColumns;
+    const auto & config = context.getConfigRef();
 
-    Block block;
-
-    ColumnWithTypeAndName col_conf_name;
-    col_conf_name.name = "config_name";
-    col_conf_name.type = std::make_shared<DataTypeString>();
-    col_conf_name.column = std::make_shared<ColumnString>();
-    block.insert(col_conf_name);
-
-    ColumnWithTypeAndName col_regexp;
-    col_regexp.name = "regexp";
-    col_regexp.type = std::make_shared<DataTypeString>();
-    col_regexp.column = std::make_shared<ColumnString>();
-    block.insert(col_regexp);
-
-    ColumnWithTypeAndName col_function;
-    col_function.name = "function";
-    col_function.type = std::make_shared<DataTypeString>();
-    col_function.column = std::make_shared<ColumnString>();
-    block.insert(col_function);
-
-    ColumnWithTypeAndName col_age;
-    col_age.name = "age";
-    col_age.type = std::make_shared<DataTypeUInt64>();
-    col_age.column = std::make_shared<ColumnUInt64>();
-    block.insert(col_age);
-
-    ColumnWithTypeAndName col_precision;
-    col_precision.name = "precision";
-    col_precision.type = std::make_shared<DataTypeUInt64>();
-    col_precision.column = std::make_shared<ColumnUInt64>();
-    block.insert(col_precision);
-
-    ColumnWithTypeAndName col_priority;
-    col_priority.name = "priority";
-    col_priority.type = std::make_shared<DataTypeUInt16>();
-    col_priority.column = std::make_shared<ColumnUInt16>();
-    block.insert(col_priority);
-
-    ColumnWithTypeAndName col_is_default;
-    col_is_default.name = "is_default";
-    col_is_default.type = std::make_shared<DataTypeUInt8>();
-    col_is_default.column = std::make_shared<ColumnUInt8>();
-    block.insert(col_is_default);
-
-    Strings sections = getAllGraphiteSections();
+    Strings sections = getAllGraphiteSections(config);
     for (const auto & section : sections)
     {
-        const auto patterns = readPatterns(section);
+        const auto patterns = readPatterns(config, section);
         for (const auto & pattern : patterns)
         {
             for (const auto & ret : pattern.retentions)
             {
-                col_conf_name.column->insert(Field(section));
-                col_regexp.column->insert(Field(pattern.regexp));
-                col_function.column->insert(Field(pattern.function));
-                col_age.column->insert(nearestFieldType(ret.age));
-                col_precision.column->insert(nearestFieldType(ret.precision));
-                col_priority.column->insert(nearestFieldType(pattern.priority));
-                col_is_default.column->insert(nearestFieldType(pattern.is_default));
+                res_columns[0]->insert(section);
+                res_columns[1]->insert(pattern.regexp);
+                res_columns[2]->insert(pattern.function);
+                res_columns[3]->insert(ret.age);
+                res_columns[4]->insert(ret.precision);
+                res_columns[5]->insert(pattern.priority);
+                res_columns[6]->insert(pattern.is_default);
             }
         }
     }
-
-    return BlockInputStreams(1, std::make_shared<OneBlockInputStream>(block));
 }
 
 }

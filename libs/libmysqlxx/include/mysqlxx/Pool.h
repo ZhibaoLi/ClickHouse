@@ -8,31 +8,30 @@
 #include <mysqlxx/Connection.h>
 
 
-#define MYSQLXX_POOL_DEFAULT_START_CONNECTIONS     1
-#define MYSQLXX_POOL_DEFAULT_MAX_CONNECTIONS     16
-#define MYSQLXX_POOL_SLEEP_ON_CONNECT_FAIL         10
+#define MYSQLXX_POOL_DEFAULT_START_CONNECTIONS 1
+#define MYSQLXX_POOL_DEFAULT_MAX_CONNECTIONS 16
+#define MYSQLXX_POOL_SLEEP_ON_CONNECT_FAIL 1
 
 
 namespace mysqlxx
 {
 
-/** Пул соединений с MySQL.
-  * Этот класс имеет мало отношения к mysqlxx и сделан не в стиле библиотеки. (взят из старого кода)
-  * Использование:
-  *     mysqlxx::Pool pool("mysql_params");
-  *
-  *        void thread()
-  *        {
-  *              mysqlxx::Pool::Entry connection = pool.Get();
-  *            std::string s = connection->query("SELECT 'Hello, world!' AS world").use().fetch()["world"].getString();
-  *        }
-  *
-  * TODO: Упростить, используя PoolBase.
-  */
+/** MySQL connections pool.
+ * This class is poorly connected with mysqlxx and is made in different style (was taken from old code).
+ * Usage:
+ *        mysqlxx::Pool pool("mysql_params");
+ *
+ *        void thread()
+ *        {
+ *              mysqlxx::Pool::Entry connection = pool.Get();
+ *            std::string s = connection->query("SELECT 'Hello, world!' AS world").use().fetch()["world"].getString();
+ *        }
+ * TODO: simplify with PoolBase.
+ */
 class Pool final
 {
 protected:
-    /** Информация о соединении. */
+    /// Information about connection.
     struct Connection
     {
         mysqlxx::Connection conn;
@@ -40,7 +39,7 @@ protected:
     };
 
 public:
-    /** Соединение с базой данных. */
+    /// Connection with database.
     class Entry
     {
     public:
@@ -114,15 +113,15 @@ public:
         friend class Pool;
 
     private:
-        /** Указатель на соединение. */
+        /// Pointer to mysqlxx connection.
         Connection * data = nullptr;
-        /** Указатель на пул, которому мы принадлежим. */
+        /// Pointer to pool we are belonging to.
         Pool * pool = nullptr;
 
-        /** Переподключается к базе данных в случае необходимости. Если не удалось - подождать и попробовать снова. */
+        /// Connects to database. If connection is failed then waits and repeats again.
         void forceConnected() const;
 
-        /** Переподключается к базе данных в случае необходимости. Если не удалось - вернуть false. */
+        /// Connects to database. If connection is failed then returns false.
         bool tryForceConnected() const
         {
             return data->conn.ping();
@@ -142,96 +141,97 @@ public:
     {}
 
     /**
-     * @param config_name            Имя параметра в конфигурационном файле
-     * @param default_connections_    Количество подключений по-умолчанию
-     * @param max_connections_        Максимальное количество подключений
+     * @param config_name             Setting name in configuration file
+     * @param default_connections_    Number of default connections
+     * @param max_connections_        Maximum number of connections
      */
     Pool(const Poco::Util::AbstractConfiguration & cfg, const std::string & config_name,
          unsigned default_connections_ = MYSQLXX_POOL_DEFAULT_START_CONNECTIONS,
          unsigned max_connections_ = MYSQLXX_POOL_DEFAULT_MAX_CONNECTIONS,
          const char * parent_config_name_ = nullptr);
 
-    /**
-     * @param db_                    Имя БД
-     * @param server_                Хост для подключения
-     * @param user_                    Имя пользователя
-     * @param password_                Пароль
-     * @param port_                    Порт для подключения
-     * @param default_connections_    Количество подключений по-умолчанию
-     * @param max_connections_        Максимальное количество подключений
-     */
+    /** Like with mysqlxx::Connection, either port either socket should be specified.
+      * If server is localhost and socket is not empty, than socket is used. Otherwise, server and port is used.
+      */
     Pool(const std::string & db_,
          const std::string & server_,
          const std::string & user_ = "",
          const std::string & password_ = "",
          unsigned port_ = 0,
+         const std::string & socket_ = "",
          unsigned connect_timeout_ = MYSQLXX_DEFAULT_TIMEOUT,
          unsigned rw_timeout_ = MYSQLXX_DEFAULT_RW_TIMEOUT,
          unsigned default_connections_ = MYSQLXX_POOL_DEFAULT_START_CONNECTIONS,
-         unsigned max_connections_ = MYSQLXX_POOL_DEFAULT_MAX_CONNECTIONS)
+         unsigned max_connections_ = MYSQLXX_POOL_DEFAULT_MAX_CONNECTIONS,
+         unsigned enable_local_infile_ = MYSQLXX_DEFAULT_ENABLE_LOCAL_INFILE)
     : default_connections(default_connections_), max_connections(max_connections_),
-    db(db_), server(server_), user(user_), password(password_), port(port_),
-    connect_timeout(connect_timeout_), rw_timeout(rw_timeout_) {}
+    db(db_), server(server_), user(user_), password(password_), port(port_), socket(socket_),
+    connect_timeout(connect_timeout_), rw_timeout(rw_timeout_), enable_local_infile(enable_local_infile_) {}
 
     Pool(const Pool & other)
         : default_connections{other.default_connections},
           max_connections{other.max_connections},
           db{other.db}, server{other.server},
           user{other.user}, password{other.password},
-          port{other.port}, connect_timeout{other.connect_timeout},
-          rw_timeout{other.rw_timeout}
+          port{other.port}, socket{other.socket},
+          connect_timeout{other.connect_timeout}, rw_timeout{other.rw_timeout},
+          enable_local_infile{other.enable_local_infile}
     {}
 
     Pool & operator=(const Pool &) = delete;
 
     ~Pool();
 
-    /** Выделяет соединение для работы. */
+    /// Allocates connection.
     Entry Get();
 
-    /** Выделяет соединение для работы.
-      * Если база недоступна - возвращает пустой объект Entry.
-      * Если пул переполнен - кидает исключение.
-      */
+    /// Allocates connection.
+    /// If database is not accessible, returns empty Entry object.
+    /// If pool is overflowed, throws exception.
     Entry tryGet();
 
-    /// Получить описание БД
+    /// Get description of database.
     std::string getDescription() const
     {
         return description;
     }
 
 protected:
-    /** Количество соединений с MySQL, создаваемых при запуске. */
+    /// Number of MySQL connections which are created at launch.
     unsigned default_connections;
-    /** Максимально возможное количество соедиений. */
+    /// Maximum possible number of connections
     unsigned max_connections;
 
 private:
-    /** Признак того, что мы инициализированы. */
+    /// Initialization flag.
     bool initialized{false};
-    /** Список соединений. */
+    /// List of connections.
     using Connections = std::list<Connection *>;
-    /** Список соединений. */
+    /// List of connections.
     Connections connections;
-    /** Замок для доступа к списку соединений. */
+    /// Lock for connections list access
     std::mutex mutex;
-    /** Описание соединения. */
+    /// Description of connection.
     std::string description;
 
-    /** Параметры подключения. **/
+    /// Connection settings.
     std::string db;
     std::string server;
     std::string user;
     std::string password;
     unsigned port;
+    std::string socket;
     unsigned connect_timeout;
     unsigned rw_timeout;
+    std::string ssl_ca;
+    std::string ssl_cert;
+    std::string ssl_key;
+    bool enable_local_infile;
 
-    /** Хотя бы один раз было успешное соединение. */
+    /// True if connection was established at least once.
     bool was_successful{false};
 
-    /** Выполняет инициализацию класса, если мы еще не инициализированы. */
+    /// Initialises class if it wasn't.
     void initialize();
 
     /** Create new connection. */

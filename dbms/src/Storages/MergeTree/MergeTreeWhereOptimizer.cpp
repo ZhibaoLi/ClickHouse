@@ -1,17 +1,18 @@
 #include <Storages/MergeTree/MergeTreeWhereOptimizer.h>
 #include <Storages/MergeTree/MergeTreeData.h>
-#include <Storages/MergeTree/PKCondition.h>
+#include <Storages/MergeTree/KeyCondition.h>
 #include <Parsers/ASTSelectQuery.h>
 #include <Parsers/ASTFunction.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTLiteral.h>
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTSubquery.h>
-#include <Parsers/ASTSet.h>
 #include <Parsers/formatAST.h>
 #include <Common/escapeForFileName.h>
-#include <DataTypes/DataTypeNested.h>
+#include <Common/typeid_cast.h>
+#include <DataTypes/NestedUtils.h>
 #include <ext/scope_guard.h>
+#include <ext/collection_cast.h>
 #include <ext/map.h>
 #include <memory>
 #include <unordered_map>
@@ -34,18 +35,20 @@ static constexpr auto global_not_in_function_name = "globalNotIn";
 
 
 MergeTreeWhereOptimizer::MergeTreeWhereOptimizer(
-    ASTPtr & query, const Context & context, const MergeTreeData & data, const Names & column_names,
+    SelectQueryInfo & query_info,
+    const Context & context,
+    const MergeTreeData & data,
+    const Names & column_names,
     Logger * log)
-    : primary_key_columns{ext::map<std::unordered_set>(data.getSortDescription(),
-        [] (const SortColumnDescription & col) { return col.column_name; })
-        },
-        table_columns{ext::map<std::unordered_set>(data.getColumnsList(),
-        [] (const NameAndTypePair & col) { return col.name; })
-        }, block_with_constants{PKCondition::getBlockWithConstants(query, context, data.getColumnsList())},
+        : primary_key_columns{ext::collection_cast<std::unordered_set>(data.primary_key_columns)},
+        table_columns{ext::map<std::unordered_set>(data.getColumns().getAllPhysical(),
+            [] (const NameAndTypePair & col) { return col.name; })},
+        block_with_constants{KeyCondition::getBlockWithConstants(query_info.query, query_info.syntax_analyzer_result, context)},
+        prepared_sets(query_info.sets),
         log{log}
 {
     calculateColumnSizes(data, column_names);
-    auto & select = typeid_cast<ASTSelectQuery &>(*query);
+    auto & select = typeid_cast<ASTSelectQuery &>(*query_info.query);
     determineArrayJoinedNames(select);
     optimize(select);
 }
@@ -79,23 +82,24 @@ void MergeTreeWhereOptimizer::calculateColumnSizes(const MergeTreeData & data, c
 void MergeTreeWhereOptimizer::optimizeConjunction(ASTSelectQuery & select, ASTFunction * const fun) const
 {
     /// used as max possible size and indicator that appropriate condition has not been found
-    const auto no_such_condition = std::numeric_limits<std::size_t>::max();
+    const auto no_such_condition = std::numeric_limits<size_t>::max();
 
     /// { first: condition index, second: summary column size }
-    std::pair<std::size_t, std::size_t> lightest_good_condition{no_such_condition, no_such_condition};
-    std::pair<std::size_t, std::size_t> lightest_viable_condition{no_such_condition, no_such_condition};
+    std::pair<size_t, size_t> lightest_good_condition{no_such_condition, no_such_condition};
+    std::pair<size_t, size_t> lightest_viable_condition{no_such_condition, no_such_condition};
 
     auto & conditions = fun->arguments->children;
 
     /// remove condition by swapping it with the last one and calling ::pop_back()
-    const auto remove_condition_at_index = [&conditions] (const std::size_t idx) {
+    const auto remove_condition_at_index = [&conditions] (const size_t idx)
+    {
         if (idx < conditions.size() - 1)
             std::swap(conditions[idx], conditions.back());
         conditions.pop_back();
     };
 
     /// linearize conjunction and divide conditions into "good" and not-"good" ones
-    for (std::size_t idx = 0; idx < conditions.size();)
+    for (size_t idx = 0; idx < conditions.size();)
     {
         const auto condition = conditions[idx].get();
 
@@ -117,7 +121,7 @@ void MergeTreeWhereOptimizer::optimizeConjunction(ASTSelectQuery & select, ASTFu
 
         SCOPE_EXIT(++idx);
 
-        if (cannotBeMoved(condition))
+        if (cannotBeMoved(conditions[idx]))
             continue;
 
         IdentifierNameSet identifiers{};
@@ -139,7 +143,8 @@ void MergeTreeWhereOptimizer::optimizeConjunction(ASTSelectQuery & select, ASTFu
         }
     }
 
-    const auto move_condition_to_prewhere = [&] (const std::size_t idx) {
+    const auto move_condition_to_prewhere = [&] (const size_t idx)
+    {
         select.prewhere_expression = conditions[idx];
         select.children.push_back(select.prewhere_expression);
         LOG_DEBUG(log, "MergeTreeWhereOptimizer: condition `" << select.prewhere_expression << "` moved to PREWHERE");
@@ -188,7 +193,7 @@ void MergeTreeWhereOptimizer::optimizeArbitrary(ASTSelectQuery & select) const
     auto & condition = select.where_expression;
 
     /// do not optimize restricted expressions
-    if (cannotBeMoved(select.where_expression.get()))
+    if (cannotBeMoved(select.where_expression))
         return;
 
     IdentifierNameSet identifiers{};
@@ -213,14 +218,14 @@ void MergeTreeWhereOptimizer::optimizeArbitrary(ASTSelectQuery & select) const
 }
 
 
-std::size_t MergeTreeWhereOptimizer::getIdentifiersColumnSize(const IdentifierNameSet & identifiers) const
+size_t MergeTreeWhereOptimizer::getIdentifiersColumnSize(const IdentifierNameSet & identifiers) const
 {
     /** for expressions containing no columns (or where columns could not be determined otherwise) assume maximum
         *    possible size so they do not have priority in eligibility over other expressions. */
     if (identifiers.empty())
-        return std::numeric_limits<std::size_t>::max();
+        return std::numeric_limits<size_t>::max();
 
-    std::size_t size{};
+    size_t size{};
 
     for (const auto & identifier : identifiers)
         if (column_sizes.count(identifier))
@@ -245,10 +250,10 @@ bool MergeTreeWhereOptimizer::isConditionGood(const IAST * condition) const
     auto right_arg = function->arguments->children.back().get();
 
     /// try to ensure left_arg points to ASTIdentifier
-    if (!typeid_cast<const ASTIdentifier *>(left_arg) && typeid_cast<const ASTIdentifier *>(right_arg))
+    if (!isIdentifier(left_arg) && isIdentifier(right_arg))
         std::swap(left_arg, right_arg);
 
-    if (typeid_cast<const ASTIdentifier *>(left_arg))
+    if (isIdentifier(left_arg))
     {
         /// condition may be "good" if only right_arg is a constant and its value is outside the threshold
         if (const auto literal = typeid_cast<const ASTLiteral *>(right_arg))
@@ -281,8 +286,8 @@ bool MergeTreeWhereOptimizer::isConditionGood(const IAST * condition) const
 
 void MergeTreeWhereOptimizer::collectIdentifiersNoSubqueries(const IAST * const ast, IdentifierNameSet & set)
 {
-    if (const auto identifier = typeid_cast<const ASTIdentifier *>(ast))
-        return (void) set.insert(identifier->name);
+    if (auto opt_name = getIdentifierName(ast))
+        return (void) set.insert(*opt_name);
 
     if (typeid_cast<const ASTSubquery *>(ast))
         return;
@@ -316,7 +321,7 @@ bool MergeTreeWhereOptimizer::isPrimaryKeyAtom(const IAST * const ast) const
 {
     if (const auto func = typeid_cast<const ASTFunction *>(ast))
     {
-        if (!PKCondition::atom_map.count(func->name))
+        if (!KeyCondition::atom_map.count(func->name))
             return false;
 
         const auto & args = func->arguments->children;
@@ -329,7 +334,7 @@ bool MergeTreeWhereOptimizer::isPrimaryKeyAtom(const IAST * const ast) const
         if ((primary_key_columns.count(first_arg_name) && isConstant(args[1])) ||
             (primary_key_columns.count(second_arg_name) && isConstant(args[0])) ||
             (primary_key_columns.count(first_arg_name)
-                && (typeid_cast<const ASTSet *>(args[1].get()) || typeid_cast<const ASTSubquery *>(args[1].get()))))
+                && (prepared_sets.count(args[1]->range) || typeid_cast<const ASTSubquery *>(args[1].get()))))
             return true;
     }
 
@@ -342,7 +347,7 @@ bool MergeTreeWhereOptimizer::isConstant(const ASTPtr & expr) const
     const auto column_name = expr->getColumnName();
 
     if (typeid_cast<const ASTLiteral *>(expr.get()) ||
-        (block_with_constants.has(column_name) && block_with_constants.getByName(column_name).column->isConst()))
+        (block_with_constants.has(column_name) && block_with_constants.getByName(column_name).column->isColumnConst()))
         return true;
 
     return false;
@@ -359,9 +364,9 @@ bool MergeTreeWhereOptimizer::isSubsetOfTableColumns(const IdentifierNameSet & i
 }
 
 
-bool MergeTreeWhereOptimizer::cannotBeMoved(const IAST * ptr) const
+bool MergeTreeWhereOptimizer::cannotBeMoved(const ASTPtr & ptr) const
 {
-    if (const auto function_ptr = typeid_cast<const ASTFunction *>(ptr))
+    if (const auto function_ptr = typeid_cast<const ASTFunction *>(ptr.get()))
     {
         /// disallow arrayJoin expressions to be moved to PREWHERE for now
         if (array_join_function_name == function_ptr->name)
@@ -376,17 +381,16 @@ bool MergeTreeWhereOptimizer::cannotBeMoved(const IAST * ptr) const
         if ("indexHint" == function_ptr->name)
             return true;
     }
-    else if (const auto identifier_ptr = typeid_cast<const ASTIdentifier *>(ptr))
+    else if (auto opt_name = getColumnIdentifierName(ptr))
     {
         /// disallow moving result of ARRAY JOIN to PREWHERE
-        if (identifier_ptr->kind == ASTIdentifier::Column)
-            if (array_joined_names.count(identifier_ptr->name) ||
-                array_joined_names.count(DataTypeNested::extractNestedTableName(identifier_ptr->name)))
-                return true;
+        if (array_joined_names.count(*opt_name) ||
+            array_joined_names.count(Nested::extractTableName(*opt_name)))
+            return true;
     }
 
     for (const auto & child : ptr->children)
-        if (cannotBeMoved(child.get()))
+        if (cannotBeMoved(child))
             return true;
 
     return false;

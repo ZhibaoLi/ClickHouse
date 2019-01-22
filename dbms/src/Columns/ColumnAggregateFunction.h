@@ -1,6 +1,4 @@
-﻿#pragma once
-
-#include <Common/Arena.h>
+#pragma once
 
 #include <AggregateFunctions/IAggregateFunction.h>
 
@@ -16,9 +14,12 @@
 namespace DB
 {
 
+class Arena;
+using ArenaPtr = std::shared_ptr<Arena>;
+using Arenas = std::vector<ArenaPtr>;
 
 
-/** State column of aggregate functions.
+/** Column of states of aggregate functions.
   * Presented as an array of pointers to the states of aggregate functions (data).
   * The states themselves are stored in one of the pools (arenas).
   *
@@ -42,12 +43,14 @@ namespace DB
   *  specifying which individual values should be destroyed and which ones should not.
   * Clearly, this method would have a substantially non-zero price.
   */
-class ColumnAggregateFunction final : public IColumn, public std::enable_shared_from_this<ColumnAggregateFunction>
+class ColumnAggregateFunction final : public COWPtrHelper<IColumn, ColumnAggregateFunction>
 {
 public:
-    using Container_t = PaddedPODArray<AggregateDataPtr>;
+    using Container = PaddedPODArray<AggregateDataPtr>;
 
 private:
+    friend class COWPtrHelper<IColumn, ColumnAggregateFunction>;
+
     /// Memory pools. Aggregate states are allocated from them.
     Arenas arenas;
 
@@ -56,17 +59,25 @@ private:
 
     /// Source column. Used (holds source from destruction),
     ///  if this column has been constructed from another and uses all or part of its values.
-    std::shared_ptr<const ColumnAggregateFunction> src;
+    ColumnPtr src;
 
     /// Array of pointers to aggregation states, that are placed in arenas.
-    Container_t data;
+    Container data;
 
-public:
+    ColumnAggregateFunction() {}
+
     /// Create a new column that has another column as a source.
-    ColumnAggregateFunction(const ColumnAggregateFunction & other)
-        : arenas(other.arenas), func(other.func), src(other.shared_from_this())
+    MutablePtr createView() const
     {
+        MutablePtr res = create(func, arenas);
+        res->src = getPtr();
+        return res;
     }
+
+    /// If we have another column as a source (owner of data), copy all data to ourself and reset source.
+    /// This is needed before inserting new elements, because we must own these elements (to destroy them in destructor),
+    ///  but ownership of different elements cannot be mixed by different columns.
+    void ensureOwnership();
 
     ColumnAggregateFunction(const AggregateFunctionPtr & func_)
         : func(func_)
@@ -78,7 +89,13 @@ public:
     {
     }
 
-    ~ColumnAggregateFunction();
+    ColumnAggregateFunction(const ColumnAggregateFunction & src_)
+        : arenas(src_.arenas), func(src_.func), src(src_.getPtr()), data(src_.data.begin(), src_.data.end())
+    {
+    }
+
+public:
+    ~ColumnAggregateFunction() override;
 
     void set(const AggregateFunctionPtr & func_)
     {
@@ -93,18 +110,17 @@ public:
 
     /** Transform column with states of aggregate functions to column with final result values.
       */
-    ColumnPtr convertToValues() const;
+    MutableColumnPtr convertToValues() const;
 
-    std::string getName() const override { return "ColumnAggregateFunction"; }
-
-    size_t sizeOfField() const override { return sizeof(getData()[0]); }
+    std::string getName() const override { return "AggregateFunction(" + func->getName() + ")"; }
+    const char * getFamilyName() const override { return "AggregateFunction"; }
 
     size_t size() const override
     {
         return getData().size();
     }
 
-    ColumnPtr cloneEmpty() const override;;
+    MutableColumnPtr cloneEmpty() const override;
 
     Field operator[](size_t n) const override;
 
@@ -114,14 +130,14 @@ public:
 
     void insertData(const char * pos, size_t length) override;
 
-    void insertFrom(const IColumn & src, size_t n) override;
+    void insertFrom(const IColumn & from, size_t n) override;
 
     void insertFrom(ConstAggregateDataPtr place);
 
     /// Merge state at last row with specified state in another column.
     void insertMergeFrom(ConstAggregateDataPtr place);
 
-    void insertMergeFrom(const IColumn & src, size_t n);
+    void insertMergeFrom(const IColumn & from, size_t n);
 
     Arena & createOrGetArena();
 
@@ -137,7 +153,7 @@ public:
 
     size_t byteSize() const override;
 
-    size_t allocatedSize() const override;
+    size_t allocatedBytes() const override;
 
     void insertRangeFrom(const IColumn & from, size_t start, size_t length) override;
 
@@ -147,11 +163,18 @@ public:
 
     ColumnPtr permute(const Permutation & perm, size_t limit) const override;
 
-    ColumnPtr replicate(const Offsets_t & offsets) const override;
+    ColumnPtr index(const IColumn & indexes, size_t limit) const override;
 
-    Columns scatter(ColumnIndex num_columns, const Selector & selector) const override;
+    template <typename Type>
+    ColumnPtr indexImpl(const PaddedPODArray<Type> & indexes, size_t limit) const;
 
-    int compareAt(size_t n, size_t m, const IColumn & rhs_, int nan_direction_hint) const override
+    ColumnPtr replicate(const Offsets & offsets) const override;
+
+    MutableColumns scatter(ColumnIndex num_columns, const Selector & selector) const override;
+
+    void gather(ColumnGathererStream & gatherer_stream) override;
+
+    int compareAt(size_t, size_t, const IColumn &, int) const override
     {
         return 0;
     }
@@ -159,12 +182,12 @@ public:
     void getPermutation(bool reverse, size_t limit, int nan_direction_hint, Permutation & res) const override;
 
     /** More efficient manipulation methods */
-    Container_t & getData()
+    Container & getData()
     {
         return data;
     }
 
-    const Container_t & getData() const
+    const Container & getData() const
     {
         return data;
     }

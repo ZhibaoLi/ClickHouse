@@ -8,22 +8,14 @@ namespace ErrorCodes
     extern const int SET_SIZE_LIMIT_EXCEEDED;
 }
 
-DistinctSortedBlockInputStream::DistinctSortedBlockInputStream(BlockInputStreamPtr input_, const Limits & limits, size_t limit_hint_, Names columns_)
-    : description( input_->getSortDescription() )
-    , columns_names(columns_)
+DistinctSortedBlockInputStream::DistinctSortedBlockInputStream(
+    const BlockInputStreamPtr & input, const SizeLimits & set_size_limits, size_t limit_hint_, const Names & columns)
+    : description(input->getSortDescription())
+    , columns_names(columns)
     , limit_hint(limit_hint_)
-    , max_rows(limits.max_rows_in_distinct)
-    , max_bytes(limits.max_bytes_in_distinct)
-    , overflow_mode(limits.distinct_overflow_mode)
+    , set_size_limits(set_size_limits)
 {
-    children.push_back(input_);
-}
-
-String DistinctSortedBlockInputStream::getID() const
-{
-    std::stringstream res;
-    res << "DistinctSorted(" << children.back()->getID() << ")";
-    return res.str();
+    children.push_back(input);
 }
 
 Block DistinctSortedBlockInputStream::readImpl()
@@ -40,11 +32,11 @@ Block DistinctSortedBlockInputStream::readImpl()
         if (!block)
             return Block();
 
-        const ConstColumnPlainPtrs column_ptrs(getKeyColumns(block));
+        const ColumnRawPtrs column_ptrs(getKeyColumns(block));
         if (column_ptrs.empty())
             return block;
 
-        const ConstColumnPlainPtrs clearing_hint_columns(getClearingColumns(block, column_ptrs));
+        const ColumnRawPtrs clearing_hint_columns(getClearingColumns(block, column_ptrs));
 
         if (data.type == ClearableSetVariants::Type::EMPTY)
             data.init(ClearableSetVariants::chooseMethod(column_ptrs, key_sizes));
@@ -69,21 +61,8 @@ Block DistinctSortedBlockInputStream::readImpl()
         if (!has_new_data)
             continue;
 
-        if (!checkLimits())
-        {
-            if (overflow_mode == OverflowMode::THROW)
-                throw Exception("DISTINCT-Set size limit exceeded."
-                    " Rows: " + toString(data.getTotalRowCount()) +
-                    ", limit: " + toString(max_rows) +
-                    ". Bytes: " + toString(data.getTotalByteCount()) +
-                    ", limit: " + toString(max_bytes) + ".",
-                    ErrorCodes::SET_SIZE_LIMIT_EXCEEDED);
-
-            if (overflow_mode == OverflowMode::BREAK)
-                return Block();
-
-            throw Exception("Logical error: unknown overflow mode", ErrorCodes::LOGICAL_ERROR);
-        }
+        if (!set_size_limits.check(data.getTotalRowCount(), data.getTotalByteCount(), "DISTINCT", ErrorCodes::SET_SIZE_LIMIT_EXCEEDED))
+            return {};
 
         prev_block.block = block;
         prev_block.clearing_hint_columns = std::move(clearing_hint_columns);
@@ -96,20 +75,12 @@ Block DistinctSortedBlockInputStream::readImpl()
     }
 }
 
-bool DistinctSortedBlockInputStream::checkLimits() const
-{
-    if (max_rows && data.getTotalRowCount() > max_rows)
-        return false;
-    if (max_bytes && data.getTotalByteCount() > max_bytes)
-        return false;
-    return true;
-}
 
 template <typename Method>
 bool DistinctSortedBlockInputStream::buildFilter(
     Method & method,
-    const ConstColumnPlainPtrs & columns,
-    const ConstColumnPlainPtrs & clearing_hint_columns,
+    const ColumnRawPtrs & columns,
+    const ColumnRawPtrs & clearing_hint_columns,
     IColumn::Filter & filter,
     size_t rows,
     ClearableSetVariants & variants) const
@@ -143,7 +114,7 @@ bool DistinctSortedBlockInputStream::buildFilter(
 
         if (inserted)
         {
-            method.onNewKey(*it, columns.size(), i, variants.string_pool);
+            method.onNewKey(*it, columns.size(), variants.string_pool);
             has_new_data = true;
         }
 
@@ -154,11 +125,11 @@ bool DistinctSortedBlockInputStream::buildFilter(
     return has_new_data;
 }
 
-ConstColumnPlainPtrs DistinctSortedBlockInputStream::getKeyColumns(const Block & block) const
+ColumnRawPtrs DistinctSortedBlockInputStream::getKeyColumns(const Block & block) const
 {
     size_t columns = columns_names.empty() ? block.columns() : columns_names.size();
 
-    ConstColumnPlainPtrs column_ptrs;
+    ColumnRawPtrs column_ptrs;
     column_ptrs.reserve(columns);
 
     for (size_t i = 0; i < columns; ++i)
@@ -168,18 +139,18 @@ ConstColumnPlainPtrs DistinctSortedBlockInputStream::getKeyColumns(const Block &
             : block.getByName(columns_names[i]).column;
 
         /// Ignore all constant columns.
-        if (!column->isConst())
+        if (!column->isColumnConst())
             column_ptrs.emplace_back(column.get());
     }
 
     return column_ptrs;
 }
 
-ConstColumnPlainPtrs DistinctSortedBlockInputStream::getClearingColumns(const Block & block, const ConstColumnPlainPtrs & key_columns) const
+ColumnRawPtrs DistinctSortedBlockInputStream::getClearingColumns(const Block & block, const ColumnRawPtrs & key_columns) const
 {
-    ConstColumnPlainPtrs clearing_hint_columns;
+    ColumnRawPtrs clearing_hint_columns;
     clearing_hint_columns.reserve(description.size());
-    for(const auto & sort_column_description : description)
+    for (const auto & sort_column_description : description)
     {
         const auto sort_column_ptr = block.safeGetByPosition(sort_column_description.column_number).column.get();
         const auto it = std::find(key_columns.cbegin(), key_columns.cend(), sort_column_ptr);
@@ -191,7 +162,7 @@ ConstColumnPlainPtrs DistinctSortedBlockInputStream::getClearingColumns(const Bl
     return clearing_hint_columns;
 }
 
-bool DistinctSortedBlockInputStream::rowsEqual(const ConstColumnPlainPtrs & lhs, size_t n, const ConstColumnPlainPtrs & rhs, size_t m)
+bool DistinctSortedBlockInputStream::rowsEqual(const ColumnRawPtrs & lhs, size_t n, const ColumnRawPtrs & rhs, size_t m)
 {
     for (size_t column_index = 0, num_columns = lhs.size(); column_index < num_columns; ++column_index)
     {

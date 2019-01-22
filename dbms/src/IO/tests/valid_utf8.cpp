@@ -7,16 +7,16 @@
 #include <iostream>
 #include <cstdio>
 
-int main(int argc, char ** argv)
+int main(int, char **)
 {
     try
     {
         std::string test1 = "kjhsgdfkjhg2378rtzgvxkz877%^&^*%&^*&*";
         std::string test2 = "{\"asd\" = \"qw1\",\"qwe24\" = \"3asd\"}";
-        test2[test2.find("1")] = char(127 + 64);
-        test2[test2.find("2")] = char(127 + 64 + 32);
-        test2[test2.find("3")] = char(127 + 64 + 32 + 16);
-        test2[test2.find("4")] = char(127 + 64 + 32 + 16 + 8);
+        test2[test2.find('1')] = char(127 + 64);
+        test2[test2.find('2')] = char(127 + 64 + 32);
+        test2[test2.find('3')] = char(127 + 64 + 32 + 16);
+        test2[test2.find('4')] = char(127 + 64 + 32 + 16 + 8);
 
         std::string str;
         {

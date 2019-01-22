@@ -1,7 +1,9 @@
 #pragma once
 
-#include <experimental/optional>
+#include <optional>
 #include <mutex>
+#include <Poco/Net/HTTPServerRequest.h>
+#include <Poco/Net/HTTPServerResponse.h>
 #include <Poco/Version.h>
 #include <IO/WriteBuffer.h>
 #include <IO/BufferWithOwnMemory.h>
@@ -10,7 +12,7 @@
 #include <IO/HTTPCommon.h>
 #include <Common/NetException.h>
 #include <Common/Stopwatch.h>
-#include <Core/Progress.h>
+#include <IO/Progress.h>
 
 
 namespace Poco
@@ -41,9 +43,11 @@ namespace DB
 class WriteBufferFromHTTPServerResponse : public BufferWithOwnMemory<WriteBuffer>
 {
 private:
+    Poco::Net::HTTPServerRequest & request;
     Poco::Net::HTTPServerResponse & response;
 
     bool add_cors_header = false;
+    unsigned keep_alive_timeout = 0;
     bool compress = false;
     ZlibCompressionMethod compression_method;
     int compression_level = Z_DEFAULT_COMPRESSION;
@@ -54,8 +58,8 @@ private:
     std::ostream * response_header_ostr = nullptr;
 #endif
 
-    std::experimental::optional<WriteBufferFromOStream> out_raw;
-    std::experimental::optional<ZlibDeflatingWriteBuffer> deflating_buf;
+    std::optional<WriteBufferFromOStream> out_raw;
+    std::optional<ZlibDeflatingWriteBuffer> deflating_buf;
 
     WriteBuffer * out = nullptr;     /// Uncompressed HTTP body is written to this buffer. Points to out_raw or possibly to deflating_buf.
 
@@ -81,7 +85,9 @@ private:
 
 public:
     WriteBufferFromHTTPServerResponse(
+        Poco::Net::HTTPServerRequest & request_,
         Poco::Net::HTTPServerResponse & response_,
+        unsigned keep_alive_timeout_,
         bool compress_ = false,        /// If true - set Content-Encoding header and compress the result.
         ZlibCompressionMethod compression_method_ = ZlibCompressionMethod::Gzip,
         size_t size = DBMS_DEFAULT_BUFFER_SIZE);
@@ -122,7 +128,7 @@ public:
         send_progress_interval_ms = send_progress_interval_ms_;
     }
 
-    ~WriteBufferFromHTTPServerResponse();
+    ~WriteBufferFromHTTPServerResponse() override;
 };
 
 }

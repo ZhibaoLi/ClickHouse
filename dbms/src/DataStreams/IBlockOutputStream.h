@@ -4,12 +4,12 @@
 #include <vector>
 #include <memory>
 #include <boost/noncopyable.hpp>
+#include <Core/Block.h>
 
 
 namespace DB
 {
 
-class Block;
 struct Progress;
 
 class TableStructureReadLock;
@@ -26,6 +26,12 @@ class IBlockOutputStream : private boost::noncopyable
 public:
     IBlockOutputStream() {}
 
+    /** Get data structure of the stream in a form of "header" block (it is also called "sample block").
+      * Header block contains column names, data types, columns of size 0. Constant columns must have corresponding values.
+      * You must pass blocks of exactly this structure to the 'write' method.
+      */
+    virtual Block getHeader() const = 0;
+
     /** Write block.
       */
     virtual void write(const Block & block) = 0;
@@ -41,14 +47,14 @@ public:
 
     /** Methods to set additional information for output in formats, that support it.
       */
-    virtual void setRowsBeforeLimit(size_t rows_before_limit) {}
-    virtual void setTotals(const Block & totals) {}
-    virtual void setExtremes(const Block & extremes) {}
+    virtual void setRowsBeforeLimit(size_t /*rows_before_limit*/) {}
+    virtual void setTotals(const Block & /*totals*/) {}
+    virtual void setExtremes(const Block & /*extremes*/) {}
 
     /** Notify about progress. Method could be called from different threads.
       * Passed value are delta, that must be summarized.
       */
-    virtual void onProgress(const Progress & progress) {}
+    virtual void onProgress(const Progress & /*progress*/) {}
 
     /** Content-Type to set when sending HTTP response.
       */
@@ -60,7 +66,7 @@ public:
       */
     void addTableLock(const TableStructureReadLockPtr & lock) { table_locks.push_back(lock); }
 
-protected:
+private:
     TableStructureReadLocks table_locks;
 };
 

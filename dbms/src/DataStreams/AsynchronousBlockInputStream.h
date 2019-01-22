@@ -7,6 +7,7 @@
 #include <Common/CurrentMetrics.h>
 #include <common/ThreadPool.h>
 #include <Common/MemoryTracker.h>
+#include <Poco/Ext/ThreadNumber.h>
 
 
 namespace CurrentMetrics
@@ -28,19 +29,12 @@ namespace DB
 class AsynchronousBlockInputStream : public IProfilingBlockInputStream
 {
 public:
-    AsynchronousBlockInputStream(BlockInputStreamPtr in_)
+    AsynchronousBlockInputStream(const BlockInputStreamPtr & in)
     {
-        children.push_back(in_);
+        children.push_back(in);
     }
 
     String getName() const override { return "Asynchronous"; }
-
-    String getID() const override
-    {
-        std::stringstream res;
-        res << "Asynchronous(" << children.back()->getID() << ")";
-        return res.str();
-    }
 
     void readPrefix() override
     {
@@ -80,6 +74,9 @@ public:
     }
 
 
+    Block getHeader() const override { return children.at(0)->getHeader(); }
+
+
     ~AsynchronousBlockInputStream() override
     {
         if (started)
@@ -95,64 +92,12 @@ protected:
     Block block;
     std::exception_ptr exception;
 
+    Block readImpl() override;
 
-    Block readImpl() override
-    {
-        /// If there were no calculations yet, calculate the first block synchronously
-        if (!started)
-        {
-            calculate(current_memory_tracker);
-            started = true;
-        }
-        else    /// If the calculations are already in progress - wait for the result
-            pool.wait();
-
-        if (exception)
-            std::rethrow_exception(exception);
-
-        Block res = block;
-        if (!res)
-            return res;
-
-        /// Start the next block calculation
-        block = Block();
-        next();
-
-        return res;
-    }
-
-
-    void next()
-    {
-        ready.reset();
-        pool.schedule(std::bind(&AsynchronousBlockInputStream::calculate, this, current_memory_tracker));
-    }
-
+    void next();
 
     /// Calculations that can be performed in a separate thread
-    void calculate(MemoryTracker * memory_tracker)
-    {
-        CurrentMetrics::Increment metric_increment{CurrentMetrics::QueryThread};
-
-        try
-        {
-            if (first)
-            {
-                first = false;
-                setThreadName("AsyncBlockInput");
-                current_memory_tracker = memory_tracker;
-                children.back()->readPrefix();
-            }
-
-            block = children.back()->read();
-        }
-        catch (...)
-        {
-            exception = std::current_exception();
-        }
-
-        ready.set();
-    }
+    void calculate();
 };
 
 }

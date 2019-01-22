@@ -5,11 +5,13 @@
 #include <IO/WriteBufferFromFileDescriptor.h>
 #include <IO/ReadBufferFromString.h>
 
+#include <chrono>
+#include <thread>
 
 using namespace DB;
 
 
-int main(int arg, char ** argv)
+int main(int, char **)
 try
 {
     {
@@ -43,6 +45,16 @@ try
 
         command->wait();
     }
+
+    // <defunct> hunting:
+    for (int i = 0; i < 1000; ++i)
+    {
+        auto command = ShellCommand::execute("echo " + std::to_string(i));
+        //command->wait(); // now automatic
+    }
+
+    // std::cerr << "inspect me: ps auxwwf" << "\n";
+    // std::this_thread::sleep_for(std::chrono::seconds(100));
 }
 catch (...)
 {

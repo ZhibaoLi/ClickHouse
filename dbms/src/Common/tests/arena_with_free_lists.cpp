@@ -8,6 +8,7 @@
     #include <Common/ArenaWithFreeLists.h>
 #endif
 
+#include <variant>
 #include <memory>
 #include <array>
 #include <sys/resource.h>
@@ -19,10 +20,18 @@
 #include <Core/Field.h>
 #include <Common/Stopwatch.h>
 #include <IO/ReadBufferFromFileDescriptor.h>
-#include <IO/CompressedReadBuffer.h>
+#include <Compression/CompressedReadBuffer.h>
 #include <IO/ReadHelpers.h>
 
 using namespace DB;
+
+namespace DB
+{
+    namespace ErrorCodes
+    {
+        extern const int SYSTEM_ERROR;
+    }
+}
 
 
 /// Implementation of ArenaWithFreeLists, which contains a bug. Used to reproduce the bug.
@@ -33,9 +42,9 @@ class ArenaWithFreeLists : private Allocator<false>
 private:
     struct Block { Block * next; };
 
-    static const std::array<std::size_t, 14> & getSizes()
+    static const std::array<size_t, 14> & getSizes()
     {
-        static constexpr std::array<std::size_t, 14> sizes{
+        static constexpr std::array<size_t, 14> sizes{
             8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536
         };
 
@@ -61,7 +70,7 @@ private:
     Arena pool;
     const std::unique_ptr<Block * []> free_lists = std::make_unique<Block * []>(ext::size(getSizes()));
 
-    static std::size_t findFreeListIndex(const std::size_t size)
+    static size_t findFreeListIndex(const size_t size)
     {
         /// shift powers of two into previous bucket by subtracting 1
         const auto bucket_num = sizeToPreviousPowerOfTwo(size);
@@ -71,13 +80,13 @@ private:
 
 public:
     ArenaWithFreeLists(
-        const std::size_t initial_size = 4096, const std::size_t growth_factor = 2,
-        const std::size_t linear_growth_threshold = 128 * 1024 * 1024)
+        const size_t initial_size = 4096, const size_t growth_factor = 2,
+        const size_t linear_growth_threshold = 128 * 1024 * 1024)
         : pool{initial_size, growth_factor, linear_growth_threshold}
     {
     }
 
-    char * alloc(const std::size_t size)
+    char * alloc(const size_t size)
     {
         if (size > getMaxFixedBlockSize())
             return static_cast<char *>(Allocator::alloc(size));
@@ -96,7 +105,7 @@ public:
         return pool.alloc(getSizes()[list_idx]);
     }
 
-    void free(const void * ptr, const std::size_t size)
+    void free(const void * ptr, const size_t size)
     {
         if (size > getMaxFixedBlockSize())
             return Allocator::free(const_cast<void *>(ptr), size);
@@ -144,12 +153,12 @@ struct Dictionary
     struct Attribute final
     {
         AttributeUnderlyingType type;
-        std::tuple<
+        std::variant<
             UInt8, UInt16, UInt32, UInt64,
             Int8, Int16, Int32, Int64,
             Float32, Float64,
             String> null_values;
-        std::tuple<
+        std::variant<
             ContainerPtrType<UInt8>, ContainerPtrType<UInt16>, ContainerPtrType<UInt32>, ContainerPtrType<UInt64>,
             ContainerPtrType<Int8>, ContainerPtrType<Int16>, ContainerPtrType<Int32>, ContainerPtrType<Int64>,
             ContainerPtrType<Float32>, ContainerPtrType<Float64>,
@@ -202,6 +211,12 @@ struct Dictionary
 
 int main(int argc, char ** argv)
 {
+    if (argc < 2)
+    {
+        std::cerr << "Usage: program n\n";
+        return 1;
+    }
+
     std::cerr << std::fixed << std::setprecision(2);
 
     size_t n = parse<size_t>(argv[1]);
@@ -230,7 +245,7 @@ int main(int argc, char ** argv)
 
         rusage resource_usage;
         if (0 != getrusage(RUSAGE_SELF, &resource_usage))
-            throwFromErrno("Cannot getrusage");
+            throwFromErrno("Cannot getrusage", ErrorCodes::SYSTEM_ERROR);
 
         size_t allocated_bytes = resource_usage.ru_maxrss * 1024;
         std::cerr << "Current memory usage: " << allocated_bytes << " bytes.\n";

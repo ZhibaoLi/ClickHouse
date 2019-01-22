@@ -16,12 +16,11 @@
 
 class ThreadPool
 {
-private:
+public:
     using Job = std::function<void()>;
 
-public:
     /// Size is constant, all threads are created immediately.
-    ThreadPool(size_t m_size);
+    explicit ThreadPool(size_t m_size);
 
     /// Add new job. Locks until free thread in pool become available or exception in one of threads was thrown.
     /// If an exception in some thread was thrown, method silently returns, and exception will be rethrown only on call to 'wait' function.
@@ -57,5 +56,21 @@ private:
 
 
     void worker();
+
+    void finalize();
 };
 
+
+/// Allows to save first catched exception in jobs and postpone its rethrow.
+class ExceptionHandler
+{
+public:
+    void setException(std::exception_ptr && exception);
+    void throwIfException();
+
+private:
+    std::exception_ptr first_exception;
+    std::mutex mutex;
+};
+
+ThreadPool::Job createExceptionHandledJob(ThreadPool::Job job, ExceptionHandler & handler);

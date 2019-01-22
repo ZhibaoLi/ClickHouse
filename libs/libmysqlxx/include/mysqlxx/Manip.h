@@ -3,6 +3,7 @@
 #include <cstring>
 #include <iostream>
 #include <type_traits>
+#include <vector>
 
 #include <mysqlxx/Types.h>
 #include <mysqlxx/Row.h>
@@ -50,8 +51,8 @@ struct EscapeManipResult
     typename std::enable_if<std::is_arithmetic<T>::value, std::ostream &>::type
     operator<< (T value) { return ostr << value; }
 
-    std::ostream & operator<< (LocalDate value)                { return ostr << value; }
-    std::ostream & operator<< (LocalDateTime value)            { return ostr << value; }
+    std::ostream & operator<< (const LocalDate & value)      { return ostr << value; }
+    std::ostream & operator<< (const LocalDateTime & value)  { return ostr << value; }
 
     std::ostream & operator<< (const std::string & value)
     {
@@ -172,8 +173,8 @@ public:
     typename std::enable_if<std::is_arithmetic<T>::value, std::ostream &>::type
     operator<< (T value) { return ostr << value; }
 
-    std::ostream & operator<< (LocalDate value)                { return ostr << '\'' << value << '\''; }
-    std::ostream & operator<< (LocalDateTime value)            { return ostr << '\'' << value << '\''; }
+    std::ostream & operator<< (const LocalDate & value)     { return ostr << '\'' << value << '\''; }
+    std::ostream & operator<< (const LocalDateTime & value) { return ostr << '\'' << value << '\''; }
 
     std::ostream & operator<< (const std::string & value)
     {

@@ -5,9 +5,11 @@
 #include <Columns/ColumnFixedString.h>
 #include <Columns/ColumnConst.h>
 #include <Columns/ColumnArray.h>
-#include <Common/StringUtils.h>
+#include <Common/StringUtils/StringUtils.h>
+#include <Common/typeid_cast.h>
 #include <Functions/IFunction.h>
 #include <Functions/Regexps.h>
+#include <Functions/FunctionHelpers.h>
 #include <DataTypes/DataTypeString.h>
 #include <IO/WriteHelpers.h>
 
@@ -18,6 +20,7 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int NUMBER_OF_ARGUMENTS_DOESNT_MATCH;
+    extern const int BAD_ARGUMENTS;
 }
 
 
@@ -63,13 +66,13 @@ public:
     /// Check the type of the function's arguments.
     static void checkArguments(const DataTypes & arguments)
     {
-        if (!typeid_cast<const DataTypeString *>(&*arguments[0]))
+        if (!isString(arguments[0]))
             throw Exception("Illegal type " + arguments[0]->getName() + " of first argument of function " + getName() + ". Must be String.",
                 ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
     }
 
     /// Initialize by the function arguments.
-    void init(Block & block, const ColumnNumbers & arguments) {}
+    void init(Block & /*block*/, const ColumnNumbers & /*arguments*/) {}
 
     /// Called for each next string.
     void set(Pos pos_, Pos end_)
@@ -121,28 +124,28 @@ public:
 
     static void checkArguments(const DataTypes & arguments)
     {
-        if (!typeid_cast<const DataTypeString *>(&*arguments[0]))
+        if (!isString(arguments[0]))
             throw Exception("Illegal type " + arguments[0]->getName() + " of first argument of function " + getName() + ". Must be String.",
                 ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
 
-        if (!typeid_cast<const DataTypeString *>(&*arguments[1]))
+        if (!isString(arguments[1]))
             throw Exception("Illegal type " + arguments[1]->getName() + " of second argument of function " + getName() + ". Must be String.",
                 ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
     }
 
     void init(Block & block, const ColumnNumbers & arguments)
     {
-        const ColumnConstString * col = typeid_cast<const ColumnConstString *>(block.safeGetByPosition(arguments[0]).column.get());
+        const ColumnConst * col = checkAndGetColumnConstStringOrFixedString(block.getByPosition(arguments[0]).column.get());
 
         if (!col)
-            throw Exception("Illegal column " + block.safeGetByPosition(arguments[0]).column->getName()
+            throw Exception("Illegal column " + block.getByPosition(arguments[0]).column->getName()
                 + " of first argument of function " + getName() + ". Must be constant string.",
                 ErrorCodes::ILLEGAL_COLUMN);
 
-        const String & sep_str = col->getData();
+        String sep_str = col->getValue<String>();
 
         if (sep_str.size() != 1)
-            throw Exception("Illegal separator for function " + getName() + ". Must be exactly one byte.");
+            throw Exception("Illegal separator for function " + getName() + ". Must be exactly one byte.", ErrorCodes::BAD_ARGUMENTS);
 
         sep = sep_str[0];
     }
@@ -200,14 +203,17 @@ public:
 
     void init(Block & block, const ColumnNumbers & arguments)
     {
-        const ColumnConstString * col = typeid_cast<const ColumnConstString *>(block.safeGetByPosition(arguments[0]).column.get());
+        const ColumnConst * col = checkAndGetColumnConstStringOrFixedString(block.getByPosition(arguments[0]).column.get());
 
         if (!col)
-            throw Exception("Illegal column " + block.safeGetByPosition(arguments[0]).column->getName()
+            throw Exception("Illegal column " + block.getByPosition(arguments[0]).column->getName()
                 + " of first argument of function " + getName() + ". Must be constant string.",
                 ErrorCodes::ILLEGAL_COLUMN);
 
-        sep = col->getData();
+        sep = col->getValue<String>();
+
+        if (sep.empty())
+            throw Exception("Illegal separator for function " + getName() + ". Must be not empty.", ErrorCodes::BAD_ARGUMENTS);
     }
 
     /// Returns the position of the argument that is the column of strings
@@ -259,7 +265,7 @@ public:
     static size_t getNumberOfArguments() { return 2; }
 
     /// Check the type of function arguments.
-    static void checkArguments( const DataTypes &  arguments )
+    static void checkArguments(const DataTypes & arguments)
     {
         SplitByStringImpl::checkArguments(arguments);
     }
@@ -267,14 +273,14 @@ public:
     /// Initialize by the function arguments.
     void init(Block & block, const ColumnNumbers & arguments)
     {
-        const ColumnConstString * col = typeid_cast<const ColumnConstString *>(block.safeGetByPosition(arguments[1]).column.get());
+        const ColumnConst * col = checkAndGetColumnConstStringOrFixedString(block.getByPosition(arguments[1]).column.get());
 
         if (!col)
-            throw Exception("Illegal column " + block.safeGetByPosition(arguments[1]).column->getName()
+            throw Exception("Illegal column " + block.getByPosition(arguments[1]).column->getName()
                 + " of first argument of function " + getName() + ". Must be constant string.",
                 ErrorCodes::ILLEGAL_COLUMN);
 
-        re = Regexps::get<false, false>(col->getData());
+        re = Regexps::get<false, false>(col->getValue<String>());
         capture = re->getNumberOfSubpatterns() > 0 ? 1 : 0;
 
         matches.resize(capture + 1);
@@ -299,13 +305,22 @@ public:
         if (!pos || pos > end)
             return false;
 
-        if (!re->match(pos, end - pos, matches) || !matches[capture].length)
+        if (!re->match(pos, end - pos, matches) || !matches[0].length)
             return false;
 
-        token_begin = pos + matches[capture].offset;
-        token_end = token_begin + matches[capture].length;
+        if (matches[capture].offset == std::string::npos)
+        {
+            /// Empty match.
+            token_begin = pos;
+            token_end = pos;
+        }
+        else
+        {
+            token_begin = pos + matches[capture].offset;
+            token_end = token_begin + matches[capture].length;
+        }
 
-        pos += matches[capture].offset + matches[capture].length;
+        pos += matches[0].offset + matches[0].length;
 
         return true;
     }
@@ -317,7 +332,7 @@ class FunctionTokens : public IFunction
 {
 public:
     static constexpr auto name = Generator::name;
-    static FunctionPtr create(const Context & context) { return std::make_shared<FunctionTokens>(); }
+    static FunctionPtr create(const Context &) { return std::make_shared<FunctionTokens>(); }
 
     String getName() const override
     {
@@ -333,27 +348,26 @@ public:
         return std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>());
     }
 
-    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result) override
+    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t /*input_rows_count*/) override
     {
         Generator generator;
         generator.init(block, arguments);
-        size_t arrayArgumentPosition = arguments[generator.getStringsArgumentPosition()];
+        size_t array_argument_position = arguments[generator.getStringsArgumentPosition()];
 
-        const ColumnString * col_str = typeid_cast<const ColumnString *>(block.safeGetByPosition(arrayArgumentPosition).column.get());
-        const ColumnConstString * col_const_str =
-                typeid_cast<const ColumnConstString *>(block.safeGetByPosition(arrayArgumentPosition).column.get());
+        const ColumnString * col_str = checkAndGetColumn<ColumnString>(block.getByPosition(array_argument_position).column.get());
+        const ColumnConst * col_const_str =
+                checkAndGetColumnConstStringOrFixedString(block.getByPosition(array_argument_position).column.get());
 
-        auto col_res = std::make_shared<ColumnArray>(std::make_shared<ColumnString>());
-        ColumnPtr col_res_holder = col_res;
+        auto col_res = ColumnArray::create(ColumnString::create());
         ColumnString & res_strings = typeid_cast<ColumnString &>(col_res->getData());
-        ColumnArray::Offsets_t & res_offsets = col_res->getOffsets();
-        ColumnString::Chars_t & res_strings_chars = res_strings.getChars();
-        ColumnString::Offsets_t & res_strings_offsets = res_strings.getOffsets();
+        ColumnArray::Offsets & res_offsets = col_res->getOffsets();
+        ColumnString::Chars & res_strings_chars = res_strings.getChars();
+        ColumnString::Offsets & res_strings_offsets = res_strings.getOffsets();
 
         if (col_str)
         {
-            const ColumnString::Chars_t & src_chars = col_str->getChars();
-            const ColumnString::Offsets_t & src_offsets = col_str->getOffsets();
+            const ColumnString::Chars & src_chars = col_str->getChars();
+            const ColumnString::Offsets & src_offsets = col_str->getOffsets();
 
             res_offsets.reserve(src_offsets.size());
             res_strings_offsets.reserve(src_offsets.size() * 5);    /// Constant 5 - at random.
@@ -363,9 +377,9 @@ public:
             Pos token_end = nullptr;
 
             size_t size = src_offsets.size();
-            ColumnString::Offset_t current_src_offset = 0;
-            ColumnArray::Offset_t current_dst_offset = 0;
-            ColumnString::Offset_t current_dst_strings_offset = 0;
+            ColumnString::Offset current_src_offset = 0;
+            ColumnArray::Offset current_dst_offset = 0;
+            ColumnString::Offset current_dst_strings_offset = 0;
             for (size_t i = 0; i < size; ++i)
             {
                 Pos pos = reinterpret_cast<Pos>(&src_chars[current_src_offset]);
@@ -392,11 +406,11 @@ public:
                 res_offsets.push_back(current_dst_offset);
             }
 
-            block.safeGetByPosition(result).column = col_res_holder;
+            block.getByPosition(result).column = std::move(col_res);
         }
         else if (col_const_str)
         {
-            String src = col_const_str->getData();
+            String src = col_const_str->getValue<String>();
             Array dst;
 
             generator.set(src.data(), src.data() + src.size());
@@ -406,11 +420,11 @@ public:
             while (generator.get(token_begin, token_end))
                 dst.push_back(String(token_begin, token_end - token_begin));
 
-            block.safeGetByPosition(result).column = std::make_shared<ColumnConstArray>(col_const_str->size(), dst, std::make_shared<DataTypeArray>(std::make_shared<DataTypeString>()));
+            block.getByPosition(result).column = block.getByPosition(result).type->createColumnConst(col_const_str->size(), dst);
         }
         else
-            throw Exception("Illegal columns " + block.safeGetByPosition(arrayArgumentPosition).column->getName()
-                    + ", " + block.safeGetByPosition(arrayArgumentPosition).column->getName()
+            throw Exception("Illegal columns " + block.getByPosition(array_argument_position).column->getName()
+                    + ", " + block.getByPosition(array_argument_position).column->getName()
                     + " of arguments of function " + getName(),
                 ErrorCodes::ILLEGAL_COLUMN);
     }
@@ -422,12 +436,12 @@ class FunctionArrayStringConcat : public IFunction
 {
 private:
     void executeInternal(
-        const ColumnString::Chars_t & src_chars,
-        const ColumnString::Offsets_t & src_string_offsets,
-        const ColumnArray::Offsets_t & src_array_offsets,
+        const ColumnString::Chars & src_chars,
+        const ColumnString::Offsets & src_string_offsets,
+        const ColumnArray::Offsets & src_array_offsets,
         const char * delimiter, const size_t delimiter_size,
-        ColumnString::Chars_t & dst_chars,
-        ColumnString::Offsets_t & dst_string_offsets)
+        ColumnString::Chars & dst_chars,
+        ColumnString::Offsets & dst_string_offsets)
     {
         size_t size = src_array_offsets.size();
 
@@ -444,10 +458,10 @@ private:
         /// There will be as many strings as there were arrays.
         dst_string_offsets.resize(src_array_offsets.size());
 
-        ColumnArray::Offset_t current_src_array_offset = 0;
-        ColumnString::Offset_t current_src_string_offset = 0;
+        ColumnArray::Offset current_src_array_offset = 0;
+        ColumnString::Offset current_src_string_offset = 0;
 
-        ColumnString::Offset_t current_dst_string_offset = 0;
+        ColumnString::Offset current_dst_string_offset = 0;
 
         /// Loop through the array of strings.
         for (size_t i = 0; i < size; ++i)
@@ -481,7 +495,7 @@ private:
 
 public:
     static constexpr auto name = "arrayStringConcat";
-    static FunctionPtr create(const Context & context) { return std::make_shared<FunctionArrayStringConcat>(); }
+    static FunctionPtr create(const Context &) { return std::make_shared<FunctionArrayStringConcat>(); }
 
     String getName() const override
     {
@@ -498,55 +512,55 @@ public:
                 + toString(arguments.size()) + ", should be 1 or 2.",
                 ErrorCodes::NUMBER_OF_ARGUMENTS_DOESNT_MATCH);
 
-        const DataTypeArray * array_type = typeid_cast<const DataTypeArray *>(arguments[0].get());
-        if (!array_type || !typeid_cast<const DataTypeString *>(array_type->getNestedType().get()))
+        const DataTypeArray * array_type = checkAndGetDataType<DataTypeArray>(arguments[0].get());
+        if (!array_type || !isString(array_type->getNestedType()))
             throw Exception("First argument for function " + getName() + " must be array of strings.", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
 
         if (arguments.size() == 2
-            && !typeid_cast<const DataTypeString *>(arguments[1].get()))
+            && !isString(arguments[1]))
             throw Exception("Second argument for function " + getName() + " must be constant string.", ErrorCodes::ILLEGAL_TYPE_OF_ARGUMENT);
 
         return std::make_shared<DataTypeString>();
     }
 
-    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result) override
+    void executeImpl(Block & block, const ColumnNumbers & arguments, size_t result, size_t /*input_rows_count*/) override
     {
         String delimiter;
         if (arguments.size() == 2)
         {
-            const ColumnConstString * col_delim = typeid_cast<const ColumnConstString *>(block.safeGetByPosition(arguments[1]).column.get());
+            const ColumnConst * col_delim = checkAndGetColumnConstStringOrFixedString(block.getByPosition(arguments[1]).column.get());
             if (!col_delim)
                 throw Exception("Second argument for function " + getName() + " must be constant string.", ErrorCodes::ILLEGAL_COLUMN);
 
-            delimiter = col_delim->getData();
+            delimiter = col_delim->getValue<String>();
         }
 
-        if (const ColumnConstArray * col_const_arr = typeid_cast<const ColumnConstArray *>(block.safeGetByPosition(arguments[0]).column.get()))
+        if (const ColumnConst * col_const_arr = checkAndGetColumnConst<ColumnArray>(block.getByPosition(arguments[0]).column.get()))
         {
-            auto col_res = std::make_shared<ColumnConstString>(col_const_arr->size(), "");
-            block.safeGetByPosition(result).column = col_res;
-
-            const Array & src_arr = col_const_arr->getData();
-            String & dst_str = col_res->getData();
+            Array src_arr = col_const_arr->getValue<Array>();
+            String dst_str;
             for (size_t i = 0, size = src_arr.size(); i < size; ++i)
             {
                 if (i != 0)
                     dst_str += delimiter;
                 dst_str += src_arr[i].get<const String &>();
             }
+
+            block.getByPosition(result).column = block.getByPosition(result).type->createColumnConst(col_const_arr->size(), dst_str);
         }
         else
         {
-            const ColumnArray & col_arr = static_cast<const ColumnArray &>(*block.safeGetByPosition(arguments[0]).column);
+            const ColumnArray & col_arr = static_cast<const ColumnArray &>(*block.getByPosition(arguments[0]).column);
             const ColumnString & col_string = static_cast<const ColumnString &>(col_arr.getData());
 
-            std::shared_ptr<ColumnString> col_res = std::make_shared<ColumnString>();
-            block.safeGetByPosition(result).column = col_res;
+            auto col_res = ColumnString::create();
 
             executeInternal(
                 col_string.getChars(), col_string.getOffsets(), col_arr.getOffsets(),
                 delimiter.data(), delimiter.size(),
                 col_res->getChars(), col_res->getOffsets());
+
+            block.getByPosition(result).column = std::move(col_res);
         }
     }
 };

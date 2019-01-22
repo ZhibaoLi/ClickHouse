@@ -27,6 +27,12 @@ template <bool exact, bool for_tuple>
 struct UniqVariadicHash;
 
 
+/// If some arguments are not contiguous, we cannot use simple hash function,
+///  because it requires method IColumn::getDataAt to work.
+/// Note that we treat single tuple argument in the same way as multiple arguments.
+bool isAllArgumentsContiguousInMemory(const DataTypes & argument_types);
+
+
 template <>
 struct UniqVariadicHash<false, false>
 {
@@ -100,7 +106,7 @@ struct UniqVariadicHash<true, false>
         }
 
         UInt128 key;
-        hash.get128(key.first, key.second);
+        hash.get128(key.low, key.high);
         return key;
     }
 };
@@ -124,7 +130,7 @@ struct UniqVariadicHash<true, true>
         }
 
         UInt128 key;
-        hash.get128(key.first, key.second);
+        hash.get128(key.low, key.high);
         return key;
     }
 };

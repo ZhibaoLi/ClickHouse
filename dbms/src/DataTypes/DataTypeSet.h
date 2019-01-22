@@ -7,13 +7,16 @@ namespace DB
 {
 
 /** The data type corresponding to the set of values in the IN section.
-  * Used only as an intermediate option when evaluating expressions.
+  * Used only as an intermediate when evaluating expressions.
   */
 class DataTypeSet final : public IDataTypeDummy
 {
 public:
-    std::string getName() const override { return "Set"; }
-    DataTypePtr clone() const override { return std::make_shared<DataTypeSet>(); }
+    static constexpr bool is_parametric = true;
+    const char * getFamilyName() const override { return "Set"; }
+    TypeIndex getTypeId() const override { return TypeIndex::Set; }
+    bool equals(const IDataType & rhs) const override { return typeid(rhs) == typeid(*this); }
+    bool isParametric() const override { return true; }
 };
 
 }

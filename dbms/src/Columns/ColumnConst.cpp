@@ -1,16 +1,8 @@
-#include <DataTypes/DataTypeString.h>
-#include <DataTypes/DataTypeFixedString.h>
-#include <DataTypes/DataTypeArray.h>
+#include <IO/WriteHelpers.h>
 
-#include <Columns/ColumnString.h>
 #include <Columns/ColumnConst.h>
-#include <Columns/ColumnArray.h>
-#include <Columns/ColumnTuple.h>
-#include <Columns/ColumnFixedString.h>
-#include <Columns/ColumnNullable.h>
-#include <DataTypes/DataTypeTuple.h>
-#include <DataTypes/DataTypeNullable.h>
-#include <ext/enumerate.h>
+#include <Columns/ColumnsCommon.h>
+#include <Common/typeid_cast.h>
 
 
 namespace DB
@@ -18,184 +10,96 @@ namespace DB
 
 namespace ErrorCodes
 {
-    extern const int TOO_LARGE_STRING_SIZE;
-    extern const int LOGICAL_ERROR;
-    extern const int NOT_IMPLEMENTED;
+    extern const int SIZES_OF_COLUMNS_DOESNT_MATCH;
 }
 
-
-template <>
-ColumnPtr ColumnConst<Null>::convertToFullColumn() const
+ColumnConst::ColumnConst(const ColumnPtr & data_, size_t s)
+    : data(data_), s(s)
 {
-    /// We basically create a column whose rows have NULL values.
+    /// Squash Const of Const.
+    while (const ColumnConst * const_data = typeid_cast<const ColumnConst *>(data.get()))
+        data = const_data->getDataColumnPtr();
 
-    ColumnPtr nested_col;
-
-    if (data_type)
-    {
-        const IDataType & nested_data_type = *typeid_cast<const DataTypeNullable &>(*data_type).getNestedType();
-        nested_col = nested_data_type.createConstColumn(s, nested_data_type.getDefault())->convertToFullColumnIfConst();
-    }
-    else
-        nested_col = std::make_shared<ColumnUInt8>(s, 0);
-
-    ColumnPtr null_map = std::make_shared<ColumnUInt8>(s, 1);
-
-    return std::make_shared<ColumnNullable>(nested_col, null_map);
+    if (data->size() != 1)
+        throw Exception("Incorrect size of nested column in constructor of ColumnConst: " + toString(data->size()) + ", must be 1.",
+            ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
 }
 
-
-template <> ColumnPtr ColumnConst<String>::convertToFullColumn() const
+ColumnPtr ColumnConst::convertToFullColumn() const
 {
-    if (!data_type || typeid_cast<const DataTypeString *>(&*data_type))
-    {
-        auto res = std::make_shared<ColumnString>();
-        ColumnString::Offsets_t & offsets = res->getOffsets();
-        ColumnString::Chars_t & vec = res->getChars();
-
-        size_t string_size = data.size() + 1;
-        size_t offset = 0;
-        offsets.resize(s);
-        vec.resize(s * string_size);
-
-        for (size_t i = 0; i < s; ++i)
-        {
-            memcpy(&vec[offset], data.data(), string_size);
-            offset += string_size;
-            offsets[i] = offset;
-        }
-
-        return res;
-    }
-    else if (const DataTypeFixedString * type = typeid_cast<const DataTypeFixedString *>(&*data_type))
-    {
-        size_t n = type->getN();
-
-        if (data.size() > n)
-            throw Exception("Too long value for " + type->getName(), ErrorCodes::TOO_LARGE_STRING_SIZE);
-
-        auto res = std::make_shared<ColumnFixedString>(n);
-        ColumnFixedString::Chars_t & vec = res->getChars();
-
-        vec.resize_fill(n * s);
-        size_t offset = 0;
-
-        for (size_t i = 0; i < s; ++i)
-        {
-            memcpy(&vec[offset], data.data(), data.size());
-            offset += n;
-        }
-
-        return res;
-    }
-    else
-        throw Exception("Invalid data type in ColumnConstString: " + data_type->getName(), ErrorCodes::LOGICAL_ERROR);
+    return data->replicate(Offsets(1, s));
 }
 
-
-ColumnPtr ColumnConst<Array>::convertToFullColumn() const
+ColumnPtr ColumnConst::removeLowCardinality() const
 {
-    if (!data_type)
-        throw Exception("No data type specified for ColumnConstArray", ErrorCodes::LOGICAL_ERROR);
+    return ColumnConst::create(data->convertToFullColumnIfLowCardinality(), s);
+}
 
-    const DataTypeArray * type = typeid_cast<const DataTypeArray *>(&*data_type);
-    if (!type)
-        throw Exception("Non-array data type specified for ColumnConstArray", ErrorCodes::LOGICAL_ERROR);
+ColumnPtr ColumnConst::filter(const Filter & filt, ssize_t /*result_size_hint*/) const
+{
+    if (s != filt.size())
+        throw Exception("Size of filter (" + toString(filt.size()) + ") doesn't match size of column (" + toString(s) + ")",
+            ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
 
-    const Array & array = getDataFromHolderImpl();
-    size_t array_size = array.size();
+    return ColumnConst::create(data, countBytesInFilter(filt));
+}
 
-    const auto & nested_type = type->getNestedType();
-    ColumnPtr nested_column;
+ColumnPtr ColumnConst::replicate(const Offsets & offsets) const
+{
+    if (s != offsets.size())
+        throw Exception("Size of offsets (" + toString(offsets.size()) + ") doesn't match size of column (" + toString(s) + ")",
+            ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
 
-    if (nested_type->isNull())
-    {
-        /// Special case: an array of Null is actually an array of Nullable(UInt8).
-        nested_column = std::make_shared<ColumnNullable>(
-            std::make_shared<ColumnUInt8>(), std::make_shared<ColumnUInt8>());
-    }
+    size_t replicated_size = 0 == s ? 0 : offsets.back();
+    return ColumnConst::create(data, replicated_size);
+}
+
+ColumnPtr ColumnConst::permute(const Permutation & perm, size_t limit) const
+{
+    if (limit == 0)
+        limit = s;
     else
-        nested_column = type->getNestedType()->createColumn();
+        limit = std::min(s, limit);
 
-    auto res = std::make_shared<ColumnArray>(nested_column);
-    ColumnArray::Offsets_t & offsets = res->getOffsets();
+    if (perm.size() < limit)
+        throw Exception("Size of permutation (" + toString(perm.size()) + ") is less than required (" + toString(limit) + ")",
+            ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
 
-    offsets.resize(s);
-    for (size_t i = 0; i < s; ++i)
-    {
-        offsets[i] = (i + 1) * array_size;
-        for (size_t j = 0; j < array_size; ++j)
-            nested_column->insert(array[j]);
-    }
+    return ColumnConst::create(data, limit);
+}
+
+ColumnPtr ColumnConst::index(const IColumn & indexes, size_t limit) const
+{
+    if (limit == 0)
+        limit = indexes.size();
+
+    if (indexes.size() < limit)
+        throw Exception("Size of indexes (" + toString(indexes.size()) + ") is less than required (" + toString(limit) + ")",
+                        ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
+
+    return ColumnConst::create(data, limit);
+}
+
+MutableColumns ColumnConst::scatter(ColumnIndex num_columns, const Selector & selector) const
+{
+    if (s != selector.size())
+        throw Exception("Size of selector (" + toString(selector.size()) + ") doesn't match size of column (" + toString(s) + ")",
+            ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
+
+    std::vector<size_t> counts = countColumnsSizeInSelector(num_columns, selector);
+
+    MutableColumns res(num_columns);
+    for (size_t i = 0; i < num_columns; ++i)
+        res[i] = cloneResized(counts[i]);
 
     return res;
 }
 
-
-StringRef ColumnConst<Array>::getDataAt(size_t n) const
+void ColumnConst::getPermutation(bool /*reverse*/, size_t /*limit*/, int /*nan_direction_hint*/, Permutation & res) const
 {
-    throw Exception("Method getDataAt is not supported for " + this->getName(), ErrorCodes::NOT_IMPLEMENTED);
+    res.resize(s);
+    for (size_t i = 0; i < s; ++i)
+        res[i] = i;
 }
-
-UInt64 ColumnConst<Array>::get64(size_t n) const
-{
-    throw Exception("Method get64 is not supported for " + this->getName(), ErrorCodes::NOT_IMPLEMENTED);
-}
-
-StringRef ColumnConst<Array>::getDataAtWithTerminatingZero(size_t n) const
-{
-    throw Exception("Method getDataAt is not supported for " + this->getName(), ErrorCodes::NOT_IMPLEMENTED);
-}
-
-
-ColumnPtr ColumnConst<Tuple>::convertToFullColumn() const
-{
-    return convertToTupleOfConstants()->convertToFullColumnIfConst();
-}
-
-ColumnPtr ColumnConst<Tuple>::convertToTupleOfConstants() const
-{
-    if (!data_type)
-        throw Exception("No data type specified for ColumnConstTuple", ErrorCodes::LOGICAL_ERROR);
-
-    const DataTypeTuple * type = typeid_cast<const DataTypeTuple *>(&*data_type);
-    if (!type)
-        throw Exception("Non-Tuple data type specified for ColumnConstTuple", ErrorCodes::LOGICAL_ERROR);
-
-    /// Create columns for each element and convert to full columns.
-    const DataTypes & element_types = type->getElements();
-    size_t tuple_size = element_types.size();
-    Block block;
-
-    for (size_t i = 0; i < tuple_size; ++i)
-        block.insert(ColumnWithTypeAndName{
-            element_types[i]->createConstColumn(s, static_cast<const TupleBackend &>(*data)[i]),
-            element_types[i],
-            ""});
-
-    return std::make_shared<ColumnTuple>(block);
-}
-
-void ColumnConst<Tuple>::getExtremes(Field & min, Field & max) const
-{
-    min = *data;
-    max = *data;
-}
-
-StringRef ColumnConst<Tuple>::getDataAt(size_t n) const
-{
-    throw Exception("Method getDataAt is not supported for " + this->getName(), ErrorCodes::NOT_IMPLEMENTED);
-}
-
-UInt64 ColumnConst<Tuple>::get64(size_t n) const
-{
-    throw Exception("Method get64 is not supported for " + this->getName(), ErrorCodes::NOT_IMPLEMENTED);
-}
-
-StringRef ColumnConst<Tuple>::getDataAtWithTerminatingZero(size_t n) const
-{
-    throw Exception("Method getDataAt is not supported for " + this->getName(), ErrorCodes::NOT_IMPLEMENTED);
-}
-
 
 }

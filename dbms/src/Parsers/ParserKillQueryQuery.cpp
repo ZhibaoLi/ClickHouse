@@ -1,61 +1,46 @@
 #include <Parsers/ParserKillQueryQuery.h>
 #include <Parsers/ASTKillQueryQuery.h>
 
-#include <Parsers/ASTIdentifier.h>
-#include <Parsers/ASTLiteral.h>
 #include <Parsers/CommonParsers.h>
-#include <Parsers/ASTSelectQuery.h>
-#include <Parsers/ASTTablesInSelectQuery.h>
-#include <Parsers/ParserSelectQuery.h>
-#include <Parsers/ExpressionElementParsers.h>
 #include <Parsers/ExpressionListParsers.h>
 
-#include <Common/typeid_cast.h>
 
 namespace DB
 {
 
 
-bool ParserKillQueryQuery::parseImpl(Pos & pos, Pos end, ASTPtr & node, Pos & max_parsed_pos, Expected & expected)
+bool ParserKillQueryQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
 {
-    Pos begin = pos;
+    String cluster_str;
     auto query = std::make_shared<ASTKillQueryQuery>();
 
-    ParserWhitespaceOrComments ws;
+    ParserKeyword p_on{"ON"};
+    ParserKeyword p_test{"TEST"};
+    ParserKeyword p_sync{"SYNC"};
+    ParserKeyword p_async{"ASYNC"};
+    ParserKeyword p_where{"WHERE"};
+    ParserKeyword p_kill_query{"KILL QUERY"};
+    ParserExpression p_where_expression;
 
-    ws.ignore(pos, end);
-
-    if (!ParserKeyword{"KILL QUERY"}.ignore(pos, end, max_parsed_pos, expected))
+    if (!p_kill_query.ignore(pos, expected))
         return false;
 
-    ws.ignore(pos, end);
-
-    if (!ParserKeyword{"WHERE"}.ignore(pos, end, max_parsed_pos, expected))
+    if (p_on.ignore(pos, expected) && !ASTQueryWithOnCluster::parse(pos, cluster_str, expected))
         return false;
 
-    ws.ignore(pos, end);
-
-    ParserExpressionWithOptionalAlias p_where_expression(false);
-    if (!p_where_expression.parse(pos, end, query->where_expression, max_parsed_pos, expected))
+    if (!p_where.ignore(pos, expected) || !p_where_expression.parse(pos, query->where_expression, expected))
         return false;
 
-    ws.ignore(pos, end);
-
-    if (ParserKeyword{"SYNC"}.ignore(pos, end))
+    if (p_sync.ignore(pos, expected))
         query->sync = true;
-    else if (ParserKeyword{"ASYNC"}.ignore(pos, end))
+    else if (p_async.ignore(pos, expected))
         query->sync = false;
-    else if (ParserKeyword{"TEST"}.ignore(pos, end))
+    else if (p_test.ignore(pos, expected))
         query->test = true;
-    else
-        expected = "[SYNC|ASYNC|TEST]";
 
-    ws.ignore(pos, end);
-
-    query->range = StringRange(begin, pos);
-
+    query->cluster = cluster_str;
+    query->children.emplace_back(query->where_expression);
     node = std::move(query);
-
     return true;
 }
 

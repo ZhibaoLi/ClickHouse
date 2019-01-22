@@ -9,8 +9,9 @@
 #include <IO/ReadHelpers.h>
 #include <IO/WriteHelpers.h>
 #include <Common/PODArray.h>
+#include <Common/NaNUtils.h>
 #include <Poco/Exception.h>
-#include <boost/random.hpp>
+#include <pcg_random.hpp>
 
 
 /// Implementing the Reservoir Sampling algorithm. Incrementally selects from the added objects a random subset of the sample_count size.
@@ -30,7 +31,7 @@ namespace ReservoirSamplerOnEmpty
     };
 }
 
-template<typename ResultType, bool IsFloatingPoint>
+template <typename ResultType, bool IsFloatingPoint>
 struct NanLikeValueConstructor
 {
     static ResultType getValue()
@@ -38,7 +39,7 @@ struct NanLikeValueConstructor
         return std::numeric_limits<ResultType>::quiet_NaN();
     }
 };
-template<typename ResultType>
+template <typename ResultType>
 struct NanLikeValueConstructor<ResultType, false>
 {
     static ResultType getValue()
@@ -47,7 +48,7 @@ struct NanLikeValueConstructor<ResultType, false>
     }
 };
 
-template<typename T, ReservoirSamplerOnEmpty::Enum OnEmpty = ReservoirSamplerOnEmpty::THROW, typename Comparer = std::less<T> >
+template <typename T, ReservoirSamplerOnEmpty::Enum OnEmpty = ReservoirSamplerOnEmpty::THROW, typename Comparer = std::less<T>>
 class ReservoirSampler
 {
 public:
@@ -67,6 +68,9 @@ public:
 
     void insert(const T & v)
     {
+        if (isNaN(v))
+            return;
+
         sorted = false;
         ++total_values;
         if (samples.size() < sample_count)
@@ -196,7 +200,7 @@ private:
     size_t sample_count;
     size_t total_values = 0;
     Array samples;
-    boost::taus88 rng;
+    pcg32_fast rng;
     bool sorted = false;
 
 
@@ -232,6 +236,6 @@ private:
         if (OnEmpty == ReservoirSamplerOnEmpty::THROW)
             throw Poco::Exception("Quantile of empty ReservoirSampler");
         else
-            return NanLikeValueConstructor<ResultType, std::is_floating_point<ResultType>::value>::getValue();
+            return NanLikeValueConstructor<ResultType, std::is_floating_point_v<ResultType>>::getValue();
     }
 };

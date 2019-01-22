@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Parsers/IAST.h>
+#include <Parsers/ASTQueryWithOutput.h>
 #include <Parsers/ASTQueryWithOnCluster.h>
 
 namespace DB
@@ -9,7 +10,7 @@ namespace DB
 
 /** RENAME query
   */
-class ASTRenameQuery : public IAST, public ASTQueryWithOnCluster
+class ASTRenameQuery : public ASTQueryWithOutput, public ASTQueryWithOnCluster
 {
 public:
     struct Table
@@ -27,18 +28,20 @@ public:
     using Elements = std::vector<Element>;
     Elements elements;
 
-    ASTRenameQuery() = default;
-    ASTRenameQuery(const StringRange range_) : IAST(range_) {}
-
     /** Get the text that identifies this element. */
-    String getID() const override { return "Rename"; };
+    String getID(char) const override { return "Rename"; }
 
-    ASTPtr clone() const override { return std::make_shared<ASTRenameQuery>(*this); }
+    ASTPtr clone() const override
+    {
+        auto res = std::make_shared<ASTRenameQuery>(*this);
+        cloneOutputOptions(*res);
+        return res;
+    }
 
-    ASTPtr getRewrittenASTWithoutOnCluster(const std::string & new_database = {}) const override
+    ASTPtr getRewrittenASTWithoutOnCluster(const std::string & new_database) const override
     {
         auto query_ptr = clone();
-        ASTRenameQuery & query = static_cast<ASTRenameQuery &>(*query_ptr);
+        auto & query = static_cast<ASTRenameQuery &>(*query_ptr);
 
         query.cluster.clear();
         for (Element & elem : query.elements)
@@ -53,7 +56,7 @@ public:
     }
 
 protected:
-    void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override
+    void formatQueryImpl(const FormatSettings & settings, FormatState &, FormatStateStacked) const override
     {
         settings.ostr << (settings.hilite ? hilite_keyword : "") << "RENAME TABLE " << (settings.hilite ? hilite_none : "");
 

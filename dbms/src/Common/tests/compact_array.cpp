@@ -7,15 +7,13 @@
 #include <Common/CompactArray.h>
 #include <IO/WriteBufferFromFile.h>
 #include <IO/ReadBufferFromFile.h>
-
 #include <boost/filesystem.hpp>
-
 #include <string>
 #include <iostream>
 #include <fstream>
 #include <stdexcept>
-#include <unistd.h>
 #include <cstdlib>
+#include <port/unistd.h>
 
 namespace fs = boost::filesystem;
 
@@ -52,9 +50,6 @@ struct Test
             {
                 DB::WriteBufferFromFile wb(filename);
                 wb.write(reinterpret_cast<const char *>(&store), sizeof(store));
-                const unsigned char * p = reinterpret_cast<const unsigned char *>(&store);
-                for (size_t i = 0; i < sizeof(store); ++i)
-                    ++p;
             }
 
             {
@@ -229,7 +224,7 @@ struct TestSet
 
 struct Generator1
 {
-    static UInt8 execute(size_t i, size_t width)
+    static UInt8 execute(size_t, size_t width)
     {
         return (1 << width) - 1;
     }

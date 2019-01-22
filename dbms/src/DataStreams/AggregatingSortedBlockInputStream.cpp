@@ -1,9 +1,48 @@
 #include <DataStreams/AggregatingSortedBlockInputStream.h>
-#include <Common/StringUtils.h>
+#include <Common/typeid_cast.h>
+#include <Common/StringUtils/StringUtils.h>
 
 
 namespace DB
 {
+
+namespace ErrorCodes
+{
+    extern const int LOGICAL_ERROR;
+}
+
+
+AggregatingSortedBlockInputStream::AggregatingSortedBlockInputStream(
+    const BlockInputStreams & inputs_, const SortDescription & description_, size_t max_block_size_)
+    : MergingSortedBlockInputStream(inputs_, description_, max_block_size_)
+{
+    /// Fill in the column numbers that need to be aggregated.
+    for (size_t i = 0; i < num_columns; ++i)
+    {
+        ColumnWithTypeAndName & column = header.safeGetByPosition(i);
+
+        /// We leave only states of aggregate functions.
+        if (!startsWith(column.type->getName(), "AggregateFunction"))
+        {
+            column_numbers_not_to_aggregate.push_back(i);
+            continue;
+        }
+
+        /// Included into PK?
+        SortDescription::const_iterator it = description.begin();
+        for (; it != description.end(); ++it)
+            if (it->column_name == column.name || (it->column_name.empty() && it->column_number == i))
+                break;
+
+        if (it != description.end())
+        {
+            column_numbers_not_to_aggregate.push_back(i);
+            continue;
+        }
+
+        column_numbers_to_aggregate.push_back(i);
+    }
+}
 
 
 Block AggregatingSortedBlockInputStream::readImpl()
@@ -11,71 +50,32 @@ Block AggregatingSortedBlockInputStream::readImpl()
     if (finished)
         return Block();
 
-    if (children.size() == 1)
-        return children[0]->read();
+    MutableColumns merged_columns;
+    init(merged_columns);
 
-    Block merged_block;
-    ColumnPlainPtrs merged_columns;
+    if (has_collation)
+        throw Exception("Logical error: " + getName() + " does not support collations", ErrorCodes::LOGICAL_ERROR);
 
-    init(merged_block, merged_columns);
     if (merged_columns.empty())
         return Block();
 
-    /// Additional initialization.
-    if (next_key.empty())
-    {
-        next_key.columns.resize(description.size());
-
-        /// Fill in the column numbers that need to be aggregated.
-        for (size_t i = 0; i < num_columns; ++i)
-        {
-            ColumnWithTypeAndName & column = merged_block.safeGetByPosition(i);
-
-            /// We leave only states of aggregate functions.
-            if (!startsWith(column.type->getName(), "AggregateFunction"))
-            {
-                column_numbers_not_to_aggregate.push_back(i);
-                continue;
-            }
-
-            /// Included into PK?
-            SortDescription::const_iterator it = description.begin();
-            for (; it != description.end(); ++it)
-                if (it->column_name == column.name || (it->column_name.empty() && it->column_number == i))
-                    break;
-
-            if (it != description.end())
-            {
-                column_numbers_not_to_aggregate.push_back(i);
-                continue;
-            }
-
-            column_numbers_to_aggregate.push_back(i);
-        }
-    }
-
     columns_to_aggregate.resize(column_numbers_to_aggregate.size());
     for (size_t i = 0, size = columns_to_aggregate.size(); i < size; ++i)
-        columns_to_aggregate[i] = typeid_cast<ColumnAggregateFunction *>(merged_columns[column_numbers_to_aggregate[i]]);
+        columns_to_aggregate[i] = typeid_cast<ColumnAggregateFunction *>(merged_columns[column_numbers_to_aggregate[i]].get());
 
-    if (has_collation)
-        merge(merged_columns, queue_with_collation);
-    else
-        merge(merged_columns, queue);
-
-    return merged_block;
+    merge(merged_columns, queue_without_collation);
+    return header.cloneWithColumns(std::move(merged_columns));
 }
 
 
-template<class TSortCursor>
-void AggregatingSortedBlockInputStream::merge(ColumnPlainPtrs & merged_columns, std::priority_queue<TSortCursor> & queue)
+void AggregatingSortedBlockInputStream::merge(MutableColumns & merged_columns, std::priority_queue<SortCursor> & queue)
 {
     size_t merged_rows = 0;
 
     /// We take the rows in the correct order and put them in `merged_block`, while the rows are no more than `max_block_size`
     while (!queue.empty())
     {
-        TSortCursor current = queue.top();
+        SortCursor current = queue.top();
 
         setPrimaryKeyRef(next_key, current);
 
@@ -83,7 +83,6 @@ void AggregatingSortedBlockInputStream::merge(ColumnPlainPtrs & merged_columns, 
 
         if (current_key.empty())    /// The first key encountered.
         {
-            current_key.columns.resize(description.size());
             setPrimaryKeyRef(current_key, current);
             key_differs = true;
         }
@@ -132,8 +131,7 @@ void AggregatingSortedBlockInputStream::merge(ColumnPlainPtrs & merged_columns, 
 }
 
 
-template <class TSortCursor>
-void AggregatingSortedBlockInputStream::addRow(TSortCursor & cursor)
+void AggregatingSortedBlockInputStream::addRow(SortCursor & cursor)
 {
     for (size_t i = 0, size = column_numbers_to_aggregate.size(); i < size; ++i)
     {

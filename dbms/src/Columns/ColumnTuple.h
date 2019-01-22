@@ -8,30 +8,42 @@ namespace DB
 
 /** Column, that is just group of few another columns.
   *
-  * For constant Tuples, see ColumnConstTuple.
+  * For constant Tuples, see ColumnConst.
   * Mixed constant/non-constant columns is prohibited in tuple
   *  for implementation simplicity.
   */
-class ColumnTuple final : public IColumn
+class ColumnTuple final : public COWPtrHelper<IColumn, ColumnTuple>
 {
 private:
-    Block data;
+    friend class COWPtrHelper<IColumn, ColumnTuple>;
+
     Columns columns;
 
     template <bool positive>
     struct Less;
 
+    explicit ColumnTuple(MutableColumns && columns);
+    ColumnTuple(const ColumnTuple &) = default;
+
 public:
-    ColumnTuple() {}
-    ColumnTuple(Block data_);
+    /** Create immutable column using immutable arguments. This arguments may be shared with other columns.
+      * Use IColumn::mutate in order to make mutable column and mutate shared nested columns.
+      */
+    using Base = COWPtrHelper<IColumn, ColumnTuple>;
+    static Ptr create(const Columns & columns);
+    static Ptr create(Columns && arg) { return create(arg); }
 
-    std::string getName() const override { return "Tuple"; }
+    template <typename Arg, typename = typename std::enable_if<std::is_rvalue_reference<Arg &&>::value>::type>
+    static MutablePtr create(Arg && arg) { return Base::create(std::forward<Arg>(arg)); }
 
-    ColumnPtr cloneEmpty() const override;
+    std::string getName() const override;
+    const char * getFamilyName() const override { return "Tuple"; }
+
+    MutableColumnPtr cloneEmpty() const override;
 
     size_t size() const override
     {
-        return data.rows();
+        return columns.at(0)->size();
     }
 
     Field operator[](size_t n) const override;
@@ -49,21 +61,26 @@ public:
     void insertRangeFrom(const IColumn & src, size_t start, size_t length) override;
     ColumnPtr filter(const Filter & filt, ssize_t result_size_hint) const override;
     ColumnPtr permute(const Permutation & perm, size_t limit) const override;
-    ColumnPtr replicate(const Offsets_t & offsets) const override;
-    Columns scatter(ColumnIndex num_columns, const Selector & selector) const override;
+    ColumnPtr index(const IColumn & indexes, size_t limit) const override;
+    ColumnPtr replicate(const Offsets & offsets) const override;
+    MutableColumns scatter(ColumnIndex num_columns, const Selector & selector) const override;
+    void gather(ColumnGathererStream & gatherer_stream) override;
     int compareAt(size_t n, size_t m, const IColumn & rhs, int nan_direction_hint) const override;
     void getExtremes(Field & min, Field & max) const override;
     void getPermutation(bool reverse, size_t limit, int nan_direction_hint, Permutation & res) const override;
     void reserve(size_t n) override;
     size_t byteSize() const override;
-    size_t allocatedSize() const override;
-    ColumnPtr convertToFullColumnIfConst() const override;
+    size_t allocatedBytes() const override;
+    void forEachSubcolumn(ColumnCallback callback) override;
 
-    const Block & getData() const { return data; }
-    Block & getData() { return data; }
+    size_t tupleSize() const { return columns.size(); }
+
+    const IColumn & getColumn(size_t idx) const { return *columns[idx]; }
+    IColumn & getColumn(size_t idx) { return columns[idx]->assumeMutableRef(); }
 
     const Columns & getColumns() const { return columns; }
-    Columns & getColumns() { return columns; }
+
+    const ColumnPtr & getColumnPtr(size_t idx) const { return columns[idx]; }
 };
 
 

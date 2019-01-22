@@ -3,10 +3,12 @@
 #include <set>
 #include <memory>
 #include <ostream>
+#include <algorithm>
 
 #include <Core/Types.h>
 #include <Common/Exception.h>
 #include <Parsers/StringRange.h>
+#include <Parsers/IdentifierQuotingStyle.h>
 
 
 class SipHash;
@@ -20,6 +22,7 @@ namespace ErrorCodes
     extern const int NOT_A_COLUMN;
     extern const int UNKNOWN_TYPE_OF_AST_NODE;
     extern const int UNKNOWN_ELEMENT_IN_AST;
+    extern const int LOGICAL_ERROR;
 }
 
 using IdentifierNameSet = std::set<String>;
@@ -33,23 +36,26 @@ class WriteBuffer;
 
 /** Element of the syntax tree (hereinafter - directed acyclic graph with elements of semantics)
   */
-class IAST
+class IAST : public std::enable_shared_from_this<IAST>
 {
 public:
     ASTs children;
     StringRange range;
 
-    /** A string with a full query.
-      * This pointer does not allow it to be deleted while the range refers to it.
-      */
-    StringPtr query_string;
+    /// This pointer does not allow it to be deleted while the range refers to it.
+    StringPtr owned_string;
 
-    IAST() = default;
-    IAST(const StringRange range_) : range(range_) {}
     virtual ~IAST() = default;
+    IAST() = default;
+    IAST(const IAST &) = default;
+    IAST & operator=(const IAST &) = default;
 
     /** Get the canonical name of the column if the element is a column */
-    virtual String getColumnName() const { throw Exception("Trying to get name of not a column: " + getID(), ErrorCodes::NOT_A_COLUMN); }
+    String getColumnName() const;
+    virtual void appendColumnName(WriteBuffer &) const
+    {
+        throw Exception("Trying to get name of not a column: " + getID(), ErrorCodes::NOT_A_COLUMN);
+    }
 
     /** Get the alias, if any, or the canonical name of the column, if it is not. */
     virtual String getAliasOrColumnName() const { return getColumnName(); }
@@ -58,22 +64,18 @@ public:
     virtual String tryGetAlias() const { return String(); }
 
     /** Set the alias. */
-    virtual void setAlias(const String & to)
+    virtual void setAlias(const String & /*to*/)
     {
         throw Exception("Can't set alias of " + getColumnName(), ErrorCodes::UNKNOWN_TYPE_OF_AST_NODE);
     }
 
     /** Get the text that identifies this element. */
-    virtual String getID() const = 0;
+    virtual String getID(char delimiter = '_') const = 0;
 
-    /** Get a deep copy of the tree. */
+    ASTPtr ptr() { return shared_from_this(); }
+
+    /** Get a deep copy of the tree. Cloned object must have the same range. */
     virtual ASTPtr clone() const = 0;
-
-    /** Get text, describing and identifying this element and its subtree.
-      * Usually it consist of element's id and getTreeID of all children.
-      */
-    String getTreeID() const;
-    void getTreeIDImpl(WriteBuffer & out) const;
 
     /** Get hash code, identifying this element and its subtree.
       */
@@ -110,6 +112,42 @@ public:
             child->collectIdentifierNames(set);
     }
 
+    template <typename T>
+    void set(T * & field, const ASTPtr & child)
+    {
+        if (!child)
+            return;
+
+        T * casted = dynamic_cast<T *>(child.get());
+        if (!casted)
+            throw Exception("Could not cast AST subtree", ErrorCodes::LOGICAL_ERROR);
+
+        children.push_back(child);
+        field = casted;
+    }
+
+    template <typename T>
+    void replace(T * & field, const ASTPtr & child)
+    {
+        if (!child)
+            throw Exception("Trying to replace AST subtree with nullptr", ErrorCodes::LOGICAL_ERROR);
+
+        T * casted = dynamic_cast<T *>(child.get());
+        if (!casted)
+            throw Exception("Could not cast AST subtree", ErrorCodes::LOGICAL_ERROR);
+
+        for (ASTPtr & current_child : children)
+        {
+            if (current_child.get() == field)
+            {
+                current_child = child;
+                field = casted;
+                return;
+            }
+        }
+
+        throw Exception("AST subtree not found in children", ErrorCodes::LOGICAL_ERROR);
+    }
 
     /// Convert to a string.
 
@@ -117,16 +155,20 @@ public:
     struct FormatSettings
     {
         std::ostream & ostr;
-        bool hilite;
+        bool hilite = false;
         bool one_line;
+        bool always_quote_identifiers = false;
+        IdentifierQuotingStyle identifier_quoting_style = IdentifierQuotingStyle::Backticks;
 
         char nl_or_ws;
 
-        FormatSettings(std::ostream & ostr_, bool hilite_, bool one_line_)
-            : ostr(ostr_), hilite(hilite_), one_line(one_line_)
+        FormatSettings(std::ostream & ostr_, bool one_line_)
+            : ostr(ostr_), one_line(one_line_)
         {
             nl_or_ws = one_line ? ' ' : '\n';
         }
+
+        void writeIdentifier(const String & name) const;
     };
 
     /// State. For example, a set of nodes can be remembered, which we already walk through.
@@ -152,7 +194,7 @@ public:
         formatImpl(settings, state, FormatStateStacked());
     }
 
-    virtual void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const
+    virtual void formatImpl(const FormatSettings & /*settings*/, FormatState & /*state*/, FormatStateStacked /*frame*/) const
     {
         throw Exception("Unknown element in AST: " + getID()
             + ((range.first && (range.second > range.first))
@@ -161,7 +203,7 @@ public:
             ErrorCodes::UNKNOWN_ELEMENT_IN_AST);
     }
 
-    void writeAlias(const String & name, std::ostream & s, bool hilite) const;
+    void cloneChildren();
 
 public:
     /// For syntax highlighting.
@@ -179,6 +221,5 @@ private:
 
 /// Surrounds an identifier by back quotes if it is necessary.
 String backQuoteIfNeed(const String & x);
-
 
 }

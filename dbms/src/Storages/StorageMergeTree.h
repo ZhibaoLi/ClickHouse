@@ -2,10 +2,14 @@
 
 #include <ext/shared_ptr_helper.h>
 
+#include <Core/Names.h>
+#include <Storages/IStorage.h>
 #include <Storages/MergeTree/MergeTreeData.h>
 #include <Storages/MergeTree/MergeTreeDataSelectExecutor.h>
 #include <Storages/MergeTree/MergeTreeDataWriter.h>
-#include <Storages/MergeTree/MergeTreeDataMerger.h>
+#include <Storages/MergeTree/MergeTreeDataMergerMutator.h>
+#include <Storages/MergeTree/MergeTreeMutationEntry.h>
+#include <Storages/MergeTree/MergeTreeMutationStatus.h>
 #include <Storages/MergeTree/DiskSpaceMonitor.h>
 #include <Storages/MergeTree/BackgroundProcessingPool.h>
 #include <Common/SimpleIncrement.h>
@@ -18,9 +22,6 @@ namespace DB
   */
 class StorageMergeTree : public ext::shared_ptr_helper<StorageMergeTree>, public IStorage
 {
-friend class ext::shared_ptr_helper<StorageMergeTree>;
-friend class MergeTreeBlockOutputStream;
-
 public:
     void startup() override;
     void shutdown() override;
@@ -32,28 +33,24 @@ public:
     }
 
     std::string getTableName() const override { return table_name; }
+
     bool supportsSampling() const override { return data.supportsSampling(); }
-    bool supportsFinal() const override { return data.supportsFinal(); }
     bool supportsPrewhere() const override { return data.supportsPrewhere(); }
-    bool supportsParallelReplicas() const override { return true; }
+    bool supportsFinal() const override { return data.supportsFinal(); }
+    bool supportsIndexForIn() const override { return true; }
+    bool mayBenefitFromIndexForIn(const ASTPtr & left_in_operand) const override { return data.mayBenefitFromIndexForIn(left_in_operand); }
 
-    const NamesAndTypesList & getColumnsListImpl() const override { return data.getColumnsListNonMaterialized(); }
+    const ColumnsDescription & getColumns() const override { return data.getColumns(); }
+    void setColumns(ColumnsDescription columns_) override { return data.setColumns(std::move(columns_)); }
 
-    NameAndTypePair getColumn(const String & column_name) const override
-    {
-        return data.getColumn(column_name);
-    }
-
-    bool hasColumn(const String & column_name) const override
-    {
-        return data.hasColumn(column_name);
-    }
+    NameAndTypePair getColumn(const String & column_name) const override { return data.getColumn(column_name); }
+    bool hasColumn(const String & column_name) const override { return data.hasColumn(column_name); }
 
     BlockInputStreams read(
         const Names & column_names,
-        const ASTPtr & query,
+        const SelectQueryInfo & query_info,
         const Context & context,
-        QueryProcessingStage::Enum & processed_stage,
+        QueryProcessingStage::Enum processed_stage,
         size_t max_block_size,
         unsigned num_streams) override;
 
@@ -61,28 +58,42 @@ public:
 
     /** Perform the next step in combining the parts.
       */
-    bool optimize(const ASTPtr & query, const String & partition, bool final, bool deduplicate, const Settings & settings) override
-    {
-        return merge(settings.min_bytes_to_use_direct_io, true, partition, final, deduplicate);
-    }
+    bool optimize(const ASTPtr & query, const ASTPtr & partition, bool final, bool deduplicate, const Context & context) override;
 
-    void dropPartition(const ASTPtr & query, const Field & partition, bool detach, const Settings & settings) override;
-    void clearColumnInPartition(const ASTPtr & query, const Field & partition, const Field & column_name, const Settings & settings) override;
-    void attachPartition(const ASTPtr & query, const Field & partition, bool part, const Settings & settings) override;
-    void freezePartition(const Field & partition, const String & with_name, const Settings & settings) override;
+    void alterPartition(const ASTPtr & query, const PartitionCommands & commands, const Context & context) override;
+
+    void mutate(const MutationCommands & commands, const Context & context) override;
+
+    std::vector<MergeTreeMutationStatus> getMutationsStatus() const;
 
     void drop() override;
+    void truncate(const ASTPtr &, const Context &) override;
 
     void rename(const String & new_path_to_db, const String & new_database_name, const String & new_table_name) override;
 
     void alter(const AlterCommands & params, const String & database_name, const String & table_name, const Context & context) override;
 
-    bool supportsIndexForIn() const override { return true; }
+    void checkTableCanBeDropped() const override;
 
-    bool checkTableCanBeDropped() const override;
+    void checkPartitionCanBeDropped(const ASTPtr & partition) override;
+
+    ActionLock getActionLock(StorageActionBlockType action_type) override;
 
     MergeTreeData & getData() { return data; }
     const MergeTreeData & getData() const { return data; }
+
+    String getDataPath() const override { return full_path; }
+
+    ASTPtr getPartitionKeyAST() const override { return data.partition_by_ast; }
+    ASTPtr getSortingKeyAST() const override { return data.getSortingKeyAST(); }
+    ASTPtr getPrimaryKeyAST() const override { return data.getPrimaryKeyAST(); }
+    ASTPtr getSamplingKeyAST() const override { return data.getSamplingExpression(); }
+
+    Names getColumnsRequiredForPartitionKey() const override { return data.getColumnsRequiredForPartitionKey(); }
+    Names getColumnsRequiredForSortingKey() const override { return data.getColumnsRequiredForSortingKey(); }
+    Names getColumnsRequiredForPrimaryKey() const override { return data.getColumnsRequiredForPrimaryKey(); }
+    Names getColumnsRequiredForSampling() const override { return data.getColumnsRequiredForSampling(); }
+    Names getColumnsRequiredForFinal() const override { return data.getColumnsRequiredForSortingKey(); }
 
 private:
     String path;
@@ -90,64 +101,82 @@ private:
     String table_name;
     String full_path;
 
-    Context & context;
+    Context global_context;
     BackgroundProcessingPool & background_pool;
 
     MergeTreeData data;
     MergeTreeDataSelectExecutor reader;
     MergeTreeDataWriter writer;
-    MergeTreeDataMerger merger;
+    MergeTreeDataMergerMutator merger_mutator;
 
     /// For block numbers.
     SimpleIncrement increment{0};
 
     /// For clearOldParts, clearOldTemporaryDirectories.
-    StopwatchWithLock time_after_previous_cleanup;
+    AtomicStopwatch time_after_previous_cleanup;
 
+    mutable std::mutex currently_merging_mutex;
     MergeTreeData::DataParts currently_merging;
-    std::mutex currently_merging_mutex;
+    std::multimap<Int64, MergeTreeMutationEntry> current_mutations_by_version;
 
     Logger * log;
 
     std::atomic<bool> shutdown_called {false};
 
-    BackgroundProcessingPool::TaskHandle merge_task_handle;
+    BackgroundProcessingPool::TaskHandle background_task_handle;
 
-    friend struct CurrentlyMergingPartsTagger;
-
-    /** Attach the table with the appropriate name, along the appropriate path (with  / at the end),
-      *  (correctness of names and paths are not checked)
-      *  consisting of the specified columns.
-      *
-      * primary_expr_ast      - expression for sorting;
-      * date_column_name      - the name of the column with the date;
-      * index_granularity     - fow how many rows one index value is written.
-      */
-    StorageMergeTree(
-        const String & path_,
-        const String & database_name_,
-        const String & table_name_,
-        NamesAndTypesListPtr columns_,
-        const NamesAndTypesList & materialized_columns_,
-        const NamesAndTypesList & alias_columns_,
-        const ColumnDefaults & column_defaults_,
-        bool attach,
-        Context & context_,
-        ASTPtr & primary_expr_ast_,
-        const String & date_column_name_,
-        const ASTPtr & sampling_expression_, /// nullptr, if sampling is not supported.
-        size_t index_granularity_,
-        const MergeTreeData::MergingParams & merging_params_,
-        bool has_force_restore_data_flag,
-        const MergeTreeSettings & settings_);
+    void loadMutations();
 
     /** Determines what parts should be merged and merges it.
       * If aggressive - when selects parts don't takes into account their ratio size and novelty (used for OPTIMIZE query).
       * Returns true if merge is finished successfully.
       */
-    bool merge(size_t aio_threshold, bool aggressive, const String & partition, bool final, bool deduplicate);
+    bool merge(bool aggressive, const String & partition_id, bool final, bool deduplicate,
+               String * out_disable_reason = nullptr);
 
-    bool mergeTask();
+    /// Try and find a single part to mutate and mutate it. If some part was successfully mutated, return true.
+    bool tryMutatePart();
+
+    BackgroundProcessingPoolTaskResult backgroundTask();
+
+    Int64 getCurrentMutationVersion(
+        const MergeTreeData::DataPartPtr & part,
+        std::lock_guard<std::mutex> & /* currently_merging_mutex_lock */) const;
+
+    void clearOldMutations();
+
+    // Partition helpers
+    void dropPartition(const ASTPtr & partition, bool detach, const Context & context);
+    void clearColumnInPartition(const ASTPtr & partition, const Field & column_name, const Context & context);
+    void attachPartition(const ASTPtr & partition, bool part, const Context & context);
+    void replacePartitionFrom(const StoragePtr & source_table, const ASTPtr & partition, bool replace, const Context & context);
+
+    friend class MergeTreeBlockOutputStream;
+    friend class MergeTreeData;
+    friend struct CurrentlyMergingPartsTagger;
+
+protected:
+    /** Attach the table with the appropriate name, along the appropriate path (with / at the end),
+      *  (correctness of names and paths are not checked)
+      *  consisting of the specified columns.
+      *
+      * See MergeTreeData constructor for comments on parameters.
+      */
+    StorageMergeTree(
+        const String & path_,
+        const String & database_name_,
+        const String & table_name_,
+        const ColumnsDescription & columns_,
+        bool attach,
+        Context & context_,
+        const String & date_column_name,
+        const ASTPtr & partition_by_ast_,
+        const ASTPtr & order_by_ast_,
+        const ASTPtr & primary_key_ast_,
+        const ASTPtr & sample_by_ast_, /// nullptr, if sampling is not supported.
+        const MergeTreeData::MergingParams & merging_params_,
+        const MergeTreeSettings & settings_,
+        bool has_force_restore_data_flag);
 };
 
 }

@@ -2,15 +2,87 @@
 
 #include <Parsers/ASTExpressionList.h>
 #include <Parsers/ASTFunction.h>
+#include <Parsers/ASTSetQuery.h>
+#include <Parsers/ASTSelectWithUnionQuery.h>
+#include <Parsers/ASTQueryWithTableAndOutput.h>
 #include <Parsers/ASTQueryWithOnCluster.h>
 
 
 namespace DB
 {
 
+class ASTStorage : public IAST
+{
+public:
+    ASTFunction * engine = nullptr;
+    IAST * partition_by = nullptr;
+    IAST * primary_key = nullptr;
+    IAST * order_by = nullptr;
+    IAST * sample_by = nullptr;
+    ASTSetQuery * settings = nullptr;
+
+    String getID(char) const override { return "Storage definition"; }
+
+    ASTPtr clone() const override
+    {
+        auto res = std::make_shared<ASTStorage>(*this);
+        res->children.clear();
+
+        if (engine)
+            res->set(res->engine, engine->clone());
+        if (partition_by)
+            res->set(res->partition_by, partition_by->clone());
+        if (primary_key)
+            res->set(res->primary_key, primary_key->clone());
+        if (order_by)
+            res->set(res->order_by, order_by->clone());
+        if (sample_by)
+            res->set(res->sample_by, sample_by->clone());
+        if (settings)
+            res->set(res->settings, settings->clone());
+
+        return res;
+    }
+
+    void formatImpl(const FormatSettings & s, FormatState & state, FormatStateStacked frame) const override
+    {
+        if (engine)
+        {
+            s.ostr << (s.hilite ? hilite_keyword : "") << s.nl_or_ws << "ENGINE" << (s.hilite ? hilite_none : "") << " = ";
+            engine->formatImpl(s, state, frame);
+        }
+        if (partition_by)
+        {
+            s.ostr << (s.hilite ? hilite_keyword : "") << s.nl_or_ws << "PARTITION BY " << (s.hilite ? hilite_none : "");
+            partition_by->formatImpl(s, state, frame);
+        }
+        if (primary_key)
+        {
+            s.ostr << (s.hilite ? hilite_keyword : "") << s.nl_or_ws << "PRIMARY KEY " << (s.hilite ? hilite_none : "");
+            primary_key->formatImpl(s, state, frame);
+        }
+        if (order_by)
+        {
+            s.ostr << (s.hilite ? hilite_keyword : "") << s.nl_or_ws << "ORDER BY " << (s.hilite ? hilite_none : "");
+            order_by->formatImpl(s, state, frame);
+        }
+        if (sample_by)
+        {
+            s.ostr << (s.hilite ? hilite_keyword : "") << s.nl_or_ws << "SAMPLE BY " << (s.hilite ? hilite_none : "");
+            sample_by->formatImpl(s, state, frame);
+        }
+        if (settings)
+        {
+            s.ostr << (s.hilite ? hilite_keyword : "") << s.nl_or_ws << "SETTINGS " << (s.hilite ? hilite_none : "");
+            settings->formatImpl(s, state, frame);
+        }
+
+    }
+};
+
 
 /// CREATE TABLE or ATTACH TABLE query
-class ASTCreateQuery : public IAST, public ASTQueryWithOnCluster
+class ASTCreateQuery : public ASTQueryWithTableAndOutput, public ASTQueryWithOnCluster
 {
 public:
     bool attach{false};    /// Query ATTACH TABLE, not CREATE TABLE.
@@ -18,49 +90,41 @@ public:
     bool is_view{false};
     bool is_materialized_view{false};
     bool is_populate{false};
-    bool is_temporary{false};
-    String database;
-    String table;
-    ASTPtr columns;
-    ASTPtr storage;
-    ASTPtr inner_storage;    /// Internal engine for the CREATE MATERIALIZED VIEW query
+    ASTExpressionList * columns = nullptr;
+    String to_database;   /// For CREATE MATERIALIZED VIEW mv TO table.
+    String to_table;
+    ASTStorage * storage = nullptr;
     String as_database;
     String as_table;
-    ASTPtr select;
-
-    ASTCreateQuery() = default;
-    ASTCreateQuery(const StringRange range_) : IAST(range_) {}
+    ASTSelectWithUnionQuery * select = nullptr;
 
     /** Get the text that identifies this element. */
-    String getID() const override { return (attach ? "AttachQuery_" : "CreateQuery_") + database + "_" + table; };
+    String getID(char delim) const override { return (attach ? "AttachQuery" : "CreateQuery") + (delim + database) + delim + table; }
 
     ASTPtr clone() const override
     {
         auto res = std::make_shared<ASTCreateQuery>(*this);
         res->children.clear();
 
-        if (columns)        { res->columns = columns->clone();              res->children.push_back(res->columns); }
-        if (storage)        { res->storage = storage->clone();              res->children.push_back(res->storage); }
-        if (select)         { res->select = select->clone();                res->children.push_back(res->select); }
-        if (inner_storage)  { res->inner_storage = inner_storage->clone();  res->children.push_back(res->inner_storage); }
+        if (columns)
+            res->set(res->columns, columns->clone());
+        if (storage)
+            res->set(res->storage, storage->clone());
+        if (select)
+            res->set(res->select, select->clone());
+
+        cloneOutputOptions(*res);
 
         return res;
     }
 
     ASTPtr getRewrittenASTWithoutOnCluster(const std::string & new_database) const override
     {
-        auto query_ptr = clone();
-        ASTCreateQuery & query = static_cast<ASTCreateQuery &>(*query_ptr);
-
-        query.cluster.clear();
-        if (query.database.empty())
-            query.database = new_database;
-
-        return query_ptr;
+        return removeOnCluster<ASTCreateQuery>(clone(), new_database);
     }
 
 protected:
-    void formatImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override
+    void formatQueryImpl(const FormatSettings & settings, FormatState & state, FormatStateStacked frame) const override
     {
         frame.need_parens = false;
 
@@ -74,10 +138,7 @@ protected:
             formatOnCluster(settings);
 
             if (storage)
-            {
-                settings.ostr << (settings.hilite ? hilite_keyword : "") << " ENGINE" << (settings.hilite ? hilite_none : "") << " = ";
                 storage->formatImpl(settings, state, frame);
-            }
 
             return;
         }
@@ -92,7 +153,7 @@ protected:
             settings.ostr
                 << (settings.hilite ? hilite_keyword : "")
                     << (attach ? "ATTACH " : "CREATE ")
-                    << (is_temporary ? "TEMPORARY " : "")
+                    << (temporary ? "TEMPORARY " : "")
                     << what << " "
                     << (if_not_exists ? "IF NOT EXISTS " : "")
                 << (settings.hilite ? hilite_none : "")
@@ -100,10 +161,18 @@ protected:
                 formatOnCluster(settings);
         }
 
+        if (!to_table.empty())
+        {
+            settings.ostr
+                << (settings.hilite ? hilite_keyword : "") << " TO " << (settings.hilite ? hilite_none : "")
+                << (!to_database.empty() ? backQuoteIfNeed(to_database) + "." : "") << backQuoteIfNeed(to_table);
+        }
+
         if (!as_table.empty())
         {
-            settings.ostr << (settings.hilite ? hilite_keyword : "") << " AS " << (settings.hilite ? hilite_none : "")
-            << (!as_database.empty() ? backQuoteIfNeed(as_database) + "." : "") << backQuoteIfNeed(as_table);
+            settings.ostr
+                << (settings.hilite ? hilite_keyword : "") << " AS " << (settings.hilite ? hilite_none : "")
+                << (!as_database.empty() ? backQuoteIfNeed(as_database) + "." : "") << backQuoteIfNeed(as_table);
         }
 
         if (columns)
@@ -115,17 +184,8 @@ protected:
             settings.ostr << (settings.one_line ? ")" : "\n)");
         }
 
-        if (storage && !is_materialized_view && !is_view)
-        {
-            settings.ostr << (settings.hilite ? hilite_keyword : "") << " ENGINE" << (settings.hilite ? hilite_none : "") << " = ";
+        if (storage)
             storage->formatImpl(settings, state, frame);
-        }
-
-        if (inner_storage)
-        {
-            settings.ostr << (settings.hilite ? hilite_keyword : "") << " ENGINE" << (settings.hilite ? hilite_none : "") << " = ";
-            inner_storage->formatImpl(settings, state, frame);
-        }
 
         if (is_populate)
         {

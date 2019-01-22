@@ -1,158 +1,127 @@
-#include <Interpreters/ExpressionAnalyzer.h>
-#include <Interpreters/ExpressionActions.h>
-#include <Interpreters/Context.h>
+#include <DataTypes/DataTypesNumber.h>
+
+#include <Storages/System/StorageSystemOne.h>
+#include <Storages/System/StorageSystemNumbers.h>
+#include <Databases/DatabaseMemory.h>
+
 #include <Parsers/ParserSelectQuery.h>
-#include <Parsers/ASTSelectQuery.h>
-#include <Parsers/formatAST.h>
 #include <Parsers/parseQuery.h>
-#include <Parsers/ExpressionListParsers.h>
-#include <DataTypes/DataTypeFactory.h>
+
+#include <Interpreters/Context.h>
+#include <Interpreters/SyntaxAnalyzer.h>
+
+#include <IO/WriteBufferFromFileDescriptor.h>
+#include <IO/ReadBufferFromFileDescriptor.h>
+
+#include <vector>
+#include <unordered_map>
+#include <iostream>
 
 
-int main(int argc, char ** argv)
+using namespace DB;
+
+namespace DB
 {
-    using namespace DB;
-
-    try
+    namespace ErrorCodes
     {
-
-    if (argc < 2)
-    {
-        std::cerr << "at least 1 argument expected" << std::endl;
-        return 1;
+        extern const int SYNTAX_ERROR;
     }
+}
+
+struct TestEntry
+{
+    String query;
+    std::unordered_map<String, String> expected_aliases; /// alias -> AST.getID()
+    NamesAndTypesList source_columns = {};
+    Names required_result_columns = {};
+
+    bool check(const Context & context)
+    {
+        ASTPtr ast = parse(query);
+
+        auto res = SyntaxAnalyzer(context, {}).analyze(ast, source_columns, required_result_columns);
+        return checkAliases(*res);
+    }
+
+private:
+    bool checkAliases(const SyntaxAnalyzerResult & res)
+    {
+        for (const auto & alias : res.aliases)
+        {
+            const String & alias_name = alias.first;
+            if (expected_aliases.count(alias_name) == 0 ||
+                expected_aliases[alias_name] != alias.second->getID())
+            {
+                std::cout << "unexpected alias: " << alias_name << ' ' << alias.second->getID() << std::endl;
+                return false;
+            }
+            else
+                expected_aliases.erase(alias_name);
+        }
+
+        if (!expected_aliases.empty())
+        {
+            std::cout << "missing aliases: " << expected_aliases.size() << std::endl;
+            return false;
+        }
+
+        return true;
+    }
+
+    static ASTPtr parse(const std::string & query)
+    {
+        ParserSelectQuery parser;
+        std::string message;
+        auto text = query.data();
+        if (ASTPtr ast = tryParseQuery(parser, text, text + query.size(), message, false, "", false, 0))
+            return ast;
+        throw Exception(message, ErrorCodes::SYNTAX_ERROR);
+    }
+};
+
+
+int main()
+{
+    std::vector<TestEntry> queries =
+    {
+        {
+            "SELECT number AS n FROM system.numbers LIMIT 0",
+            {{"n", "Identifier_number"}},
+            { NameAndTypePair("number", std::make_shared<DataTypeUInt64>()) }
+        },
+
+        {
+            "SELECT number AS n FROM system.numbers LIMIT 0",
+            {{"n", "Identifier_number"}}
+        }
+    };
 
     Context context = Context::createGlobal();
 
-    NamesAndTypesList columns;
-    for (int i = 2; i + 1 < argc; i += 2)
+    auto system_database = std::make_shared<DatabaseMemory>("system");
+    context.addDatabase("system", system_database);
+    //context.setCurrentDatabase("system");
+    system_database->attachTable("one", StorageSystemOne::create("one"));
+    system_database->attachTable("numbers", StorageSystemNumbers::create("numbers", false));
+
+    size_t success = 0;
+    for (auto & entry : queries)
     {
-        NameAndTypePair col;
-        col.name = argv[i];
-        col.type = DataTypeFactory::instance().get(argv[i + 1]);
-        columns.push_back(col);
-    }
-
-    ASTPtr root;
-    ParserPtr parsers[] = {std::make_unique<ParserSelectQuery>(), std::make_unique<ParserExpressionList>(false)};
-    for (size_t i = 0; i < sizeof(parsers)/sizeof(parsers[0]); ++i)
-    {
-        IParser & parser = *parsers[i];
-        const char * pos = argv[1];
-        const char * end = argv[1] + strlen(argv[1]);
-        const char * max_parsed_pos = pos;
-        Expected expected = "";
-        if (parser.parse(pos, end, root, max_parsed_pos, expected))
-            break;
-        else
-            root = nullptr;
-    }
-    if (!root)
-    {
-        std::cerr << "invalid expression (should be select query or expression list)" << std::endl;
-        return 2;
-    }
-
-    formatAST(*root, std::cout);
-    std::cout << std::endl;
-
-    ExpressionAnalyzer analyzer(root, context, {}, columns);
-
-    Names required = analyzer.getRequiredColumns();
-    std::cout << "required columns:\n";
-    for (size_t i = 0; i < required.size(); ++i)
-    {
-        std::cout << required[i] << "\n";
-    }
-    std::cout << "\n";
-
-    std::cout << "only consts:\n\n" << analyzer.getConstActions()->dumpActions() << "\n";
-
-    if (analyzer.hasAggregation())
-    {
-        Names key_names;
-        AggregateDescriptions aggregates;
-        analyzer.getAggregateInfo(key_names, aggregates);
-
-        std::cout << "keys:\n";
-        for (size_t i = 0; i < key_names.size(); ++i)
-            std::cout << key_names[i] << "\n";
-        std::cout << "\n";
-
-        std::cout << "aggregates:\n";
-        for (size_t i = 0; i < aggregates.size(); ++i)
+        try
         {
-            AggregateDescription desc = aggregates[i];
-
-            std::cout << desc.column_name << " = " << desc.function->getName() << " ( ";
-            for (size_t j = 0; j < desc.argument_names.size(); ++j)
-                std::cout << desc.argument_names[j] << " ";
-            std::cout << ")\n";
-        }
-        std::cout << "\n";
-
-        ExpressionActionsChain before;
-        if (analyzer.appendWhere(before, false))
-            before.addStep();
-        analyzer.appendAggregateFunctionsArguments(before, false);
-        analyzer.appendGroupBy(before, false);
-        before.finalize();
-
-        ExpressionActionsChain after;
-        if (analyzer.appendHaving(after, false))
-            after.addStep();
-        analyzer.appendSelect(after, false);
-        analyzer.appendOrderBy(after, false);
-        after.addStep();
-        analyzer.appendProjectResult(after, false);
-        after.finalize();
-
-        std::cout << "before aggregation:\n\n";
-        for (size_t i = 0; i < before.steps.size(); ++i)
-        {
-            std::cout << before.steps[i].actions->dumpActions();
-            std::cout << std::endl;
-        }
-
-        std::cout << "\nafter aggregation:\n\n";
-        for (size_t i = 0; i < after.steps.size(); ++i)
-        {
-            std::cout << after.steps[i].actions->dumpActions();
-            std::cout << std::endl;
-        }
-    }
-    else
-    {
-        if (typeid_cast<ASTSelectQuery *>(&*root))
-        {
-            ExpressionActionsChain chain;
-            if (analyzer.appendWhere(chain, false))
-                chain.addStep();
-            analyzer.appendSelect(chain, false);
-            analyzer.appendOrderBy(chain, false);
-            chain.addStep();
-            analyzer.appendProjectResult(chain, false);
-            chain.finalize();
-
-            for (size_t i = 0; i < chain.steps.size(); ++i)
+            if (entry.check(context))
             {
-                std::cout << chain.steps[i].actions->dumpActions();
-                std::cout << std::endl;
+                ++success;
+                std::cout << "[OK] " << entry.query << std::endl;
             }
+            else
+                std::cout << "[Failed] " << entry.query << std::endl;
         }
-        else
+        catch (Exception & e)
         {
-            std::cout << "unprojected actions:\n\n" << analyzer.getActions(false)->dumpActions() << "\n";
-            std::cout << "projected actions:\n\n" << analyzer.getActions(true)->dumpActions() << "\n";
+            std::cout << "[Error] " << entry.query << std::endl << e.displayText() << std::endl;
         }
     }
 
-    }
-    catch (Exception & e)
-    {
-        std::cerr << "Exception " << e.what() << ": " << e.displayText() << "\n" << e.getStackTrace().toString();
-        return 3;
-    }
-
-    return 0;
+    return success != queries.size();
 }

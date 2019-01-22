@@ -1,9 +1,6 @@
-include_directories (${ClickHouse_SOURCE_DIR}/dbms/src)
-
 add_executable(corrector_utf8 corrector_utf8.cpp)
 
 # Link the executable to the library.
-target_link_libraries (corrector_utf8 dbms)
-add_dependencies(corrector_utf8 dbms)
+target_link_libraries(corrector_utf8 PRIVATE clickhouse_common_io)
 
-install( TARGETS corrector_utf8 RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT corrector_utf8)
+install(TARGETS corrector_utf8 RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT corrector_utf8)

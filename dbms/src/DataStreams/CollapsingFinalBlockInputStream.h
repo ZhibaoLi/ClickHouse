@@ -3,6 +3,7 @@
 #include <DataStreams/IProfilingBlockInputStream.h>
 #include <Core/SortDescription.h>
 #include <Columns/ColumnsNumber.h>
+#include <Common/typeid_cast.h>
 #include <queue>
 
 namespace DB
@@ -14,36 +15,23 @@ namespace DB
 class CollapsingFinalBlockInputStream : public IProfilingBlockInputStream
 {
 public:
-    CollapsingFinalBlockInputStream(BlockInputStreams inputs_, const SortDescription & description_,
-                                     const String & sign_column_name_)
+    CollapsingFinalBlockInputStream(
+        const BlockInputStreams & inputs,
+        const SortDescription & description_,
+        const String & sign_column_name_)
         : description(description_), sign_column_name(sign_column_name_)
     {
-        children.insert(children.end(), inputs_.begin(), inputs_.end());
+        children.insert(children.end(), inputs.begin(), inputs.end());
     }
 
-    ~CollapsingFinalBlockInputStream();
+    ~CollapsingFinalBlockInputStream() override;
 
     String getName() const override { return "CollapsingFinal"; }
 
-    String getID() const override
-    {
-        std::stringstream res;
-        res << "CollapsingFinal(inputs";
-
-        for (size_t i = 0; i < children.size(); ++i)
-            res << ", " << children[i]->getID();
-
-        res << ", description";
-
-        for (size_t i = 0; i < description.size(); ++i)
-            res << ", " << description[i].getID();
-
-        res << ", sign_column, " << sign_column_name << ")";
-        return res.str();
-    }
-
     bool isSortedOutput() const override { return true; }
     const SortDescription & getSortDescription() const override { return description; }
+
+    Block getHeader() const override { return children.at(0)->getHeader(); }
 
 protected:
     Block readImpl() override;
@@ -54,10 +42,10 @@ private:
 
     struct MergingBlock : boost::noncopyable
     {
-        MergingBlock(Block block_,
+        MergingBlock(const Block & block_,
                      size_t stream_index_,
                      const SortDescription & desc,
-                     String sign_column_name,
+                     const String & sign_column_name,
                      BlockPlainPtrs * output_blocks)
             : block(block_), stream_index(stream_index_), output_blocks(output_blocks)
         {
@@ -93,7 +81,7 @@ private:
         IColumn::Filter filter;
 
         /// Point to `block`.
-        ConstColumnPlainPtrs sort_columns;
+        ColumnRawPtrs sort_columns;
         const ColumnInt8 * sign_column;
 
         /// When it reaches zero, the block can be outputted in response.
@@ -162,7 +150,7 @@ private:
                 --ptr->refcount;
                 if (!ptr->refcount)
                 {
-                    if (std::uncaught_exception())
+                    if (std::uncaught_exceptions())
                         delete ptr;
                     else
                         ptr->output_blocks->push_back(ptr);
@@ -178,7 +166,7 @@ private:
         size_t pos;
 
         Cursor() {}
-        explicit Cursor(MergingBlockPtr block_, size_t pos_ = 0) : block(block_), pos(pos_) {}
+        explicit Cursor(const MergingBlockPtr & block_, size_t pos_ = 0) : block(block_), pos(pos_) {}
 
         bool operator< (const Cursor & rhs) const
         {

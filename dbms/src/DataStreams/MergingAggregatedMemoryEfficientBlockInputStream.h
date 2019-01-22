@@ -3,6 +3,7 @@
 #include <Interpreters/Aggregator.h>
 #include <DataStreams/IProfilingBlockInputStream.h>
 #include <Common/ConcurrentBoundedQueue.h>
+#include <Common/CurrentThread.h>
 #include <common/ThreadPool.h>
 #include <condition_variable>
 
@@ -56,7 +57,7 @@ namespace DB
   *  data from sources can also be read in several threads (reading_threads)
   *  for optimal performance in the presence of a fast network or disks (from where these blocks are read).
   */
-class MergingAggregatedMemoryEfficientBlockInputStream : public IProfilingBlockInputStream
+class MergingAggregatedMemoryEfficientBlockInputStream final : public IProfilingBlockInputStream
 {
 public:
     MergingAggregatedMemoryEfficientBlockInputStream(
@@ -67,8 +68,6 @@ public:
 
     String getName() const override { return "MergingAggregatedMemoryEfficient"; }
 
-    String getID() const override;
-
     /// Sends the request (initiates calculations) earlier than `read`.
     void readPrefix() override;
 
@@ -78,13 +77,15 @@ public:
     /** Different from the default implementation by trying to stop all sources,
       *  skipping failed by execution.
       */
-    void cancel() override;
+    void cancel(bool kill) override;
+
+    Block getHeader() const override;
 
 protected:
     Block readImpl() override;
 
 private:
-    static constexpr size_t NUM_BUCKETS = 256;
+    static constexpr int NUM_BUCKETS = 256;
 
     Aggregator aggregator;
     bool final;
@@ -137,7 +138,7 @@ private:
         std::exception_ptr exception;
         /// It is necessary to give out blocks in the order of the key (bucket_num).
         /// If the value is an empty block, you need to wait for its merge.
-        /// (This means the promise that there will be data here, which is important because the data should be given out 
+        /// (This means the promise that there will be data here, which is important because the data should be given out
         /// in the order of the key - bucket_num)
         std::map<int, Block> merged_blocks;
         std::mutex merged_blocks_mutex;
@@ -146,12 +147,12 @@ private:
         /// An event by which the main thread is telling merging threads that it is possible to process the next group of blocks.
         std::condition_variable have_space;
 
-        ParallelMergeData(size_t max_threads) : pool(max_threads) {}
+        explicit ParallelMergeData(size_t max_threads) : pool(max_threads) {}
     };
 
     std::unique_ptr<ParallelMergeData> parallel_merge_data;
 
-    void mergeThread(MemoryTracker * memory_tracker);
+    void mergeThread(ThreadGroupStatusPtr main_thread);
 
     void finalize();
 };

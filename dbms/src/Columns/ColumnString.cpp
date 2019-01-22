@@ -1,8 +1,11 @@
 #include <Core/Defines.h>
-
-#include <Common/Collator.h>
+#include <Common/Arena.h>
+#include <Columns/Collator.h>
 #include <Columns/ColumnString.h>
 #include <Columns/ColumnsCommon.h>
+#include <DataStreams/ColumnGathererStream.h>
+
+#include <common/unaligned.h>
 
 
 namespace DB
@@ -15,9 +18,9 @@ namespace ErrorCodes
 }
 
 
-ColumnPtr ColumnString::cloneResized(size_t to_size) const
+MutableColumnPtr ColumnString::cloneResized(size_t to_size) const
 {
-    auto res = std::make_shared<ColumnString>();
+    auto res = ColumnString::create();
 
     if (to_size == 0)
         return res;
@@ -35,7 +38,7 @@ ColumnPtr ColumnString::cloneResized(size_t to_size) const
     {
         /// Copy column and append empty strings for extra elements.
 
-        Offset_t offset = 0;
+        Offset offset = 0;
         if (from_size > 0)
         {
             res->offsets.assign(offsets.begin(), offsets.end());
@@ -96,12 +99,12 @@ void ColumnString::insertRangeFrom(const IColumn & src, size_t start, size_t len
 ColumnPtr ColumnString::filter(const Filter & filt, ssize_t result_size_hint) const
 {
     if (offsets.size() == 0)
-        return std::make_shared<ColumnString>();
+        return ColumnString::create();
 
-    auto res = std::make_shared<ColumnString>();
+    auto res = ColumnString::create();
 
-    Chars_t & res_chars = res->chars;
-    Offsets_t & res_offsets = res->offsets;
+    Chars & res_chars = res->chars;
+    Offsets & res_offsets = res->offsets;
 
     filterArraysImpl<UInt8>(chars, offsets, res_chars, res_offsets, filt, result_size_hint);
     return res;
@@ -121,12 +124,12 @@ ColumnPtr ColumnString::permute(const Permutation & perm, size_t limit) const
         throw Exception("Size of permutation is less than required.", ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
 
     if (limit == 0)
-        return std::make_shared<ColumnString>();
+        return ColumnString::create();
 
-    std::shared_ptr<ColumnString> res = std::make_shared<ColumnString>();
+    auto res = ColumnString::create();
 
-    Chars_t & res_chars = res->chars;
-    Offsets_t & res_offsets = res->offsets;
+    Chars & res_chars = res->chars;
+    Offsets & res_offsets = res->offsets;
 
     if (limit == size)
         res_chars.resize(chars.size());
@@ -140,12 +143,83 @@ ColumnPtr ColumnString::permute(const Permutation & perm, size_t limit) const
 
     res_offsets.resize(limit);
 
-    Offset_t current_new_offset = 0;
+    Offset current_new_offset = 0;
 
     for (size_t i = 0; i < limit; ++i)
     {
         size_t j = perm[i];
-        size_t string_offset = j == 0 ? 0 : offsets[j - 1];
+        size_t string_offset = offsets[j - 1];
+        size_t string_size = offsets[j] - string_offset;
+
+        memcpySmallAllowReadWriteOverflow15(&res_chars[current_new_offset], &chars[string_offset], string_size);
+
+        current_new_offset += string_size;
+        res_offsets[i] = current_new_offset;
+    }
+
+    return res;
+}
+
+
+StringRef ColumnString::serializeValueIntoArena(size_t n, Arena & arena, char const *& begin) const
+{
+    size_t string_size = sizeAt(n);
+    size_t offset = offsetAt(n);
+
+    StringRef res;
+    res.size = sizeof(string_size) + string_size;
+    char * pos = arena.allocContinue(res.size, begin);
+    memcpy(pos, &string_size, sizeof(string_size));
+    memcpy(pos + sizeof(string_size), &chars[offset], string_size);
+    res.data = pos;
+
+    return res;
+}
+
+const char * ColumnString::deserializeAndInsertFromArena(const char * pos)
+{
+    const size_t string_size = unalignedLoad<size_t>(pos);
+    pos += sizeof(string_size);
+
+    const size_t old_size = chars.size();
+    const size_t new_size = old_size + string_size;
+    chars.resize(new_size);
+    memcpy(&chars[old_size], pos, string_size);
+
+    offsets.push_back(new_size);
+    return pos + string_size;
+}
+
+
+ColumnPtr ColumnString::index(const IColumn & indexes, size_t limit) const
+{
+    return selectIndexImpl(*this, indexes, limit);
+}
+
+template <typename Type>
+ColumnPtr ColumnString::indexImpl(const PaddedPODArray<Type> & indexes, size_t limit) const
+{
+    if (limit == 0)
+        return ColumnString::create();
+
+    auto res = ColumnString::create();
+
+    Chars & res_chars = res->chars;
+    Offsets & res_offsets = res->offsets;
+
+    size_t new_chars_size = 0;
+    for (size_t i = 0; i < limit; ++i)
+        new_chars_size += sizeAt(indexes[i]);
+    res_chars.resize(new_chars_size);
+
+    res_offsets.resize(limit);
+
+    Offset current_new_offset = 0;
+
+    for (size_t i = 0; i < limit; ++i)
+    {
+        size_t j = indexes[i];
+        size_t string_offset = offsets[j - 1];
         size_t string_size = offsets[j] - string_offset;
 
         memcpySmallAllowReadWriteOverflow15(&res_chars[current_new_offset], &chars[string_offset], string_size);
@@ -162,7 +236,7 @@ template <bool positive>
 struct ColumnString::less
 {
     const ColumnString & parent;
-    less(const ColumnString & parent_) : parent(parent_) {}
+    explicit less(const ColumnString & parent_) : parent(parent_) {}
     bool operator()(size_t lhs, size_t rhs) const
     {
         size_t left_len = parent.sizeAt(lhs);
@@ -177,7 +251,7 @@ struct ColumnString::less
     }
 };
 
-void ColumnString::getPermutation(bool reverse, size_t limit, int nan_direction_hint, Permutation & res) const
+void ColumnString::getPermutation(bool reverse, size_t limit, int /*nan_direction_hint*/, Permutation & res) const
 {
     size_t s = offsets.size();
     res.resize(s);
@@ -204,25 +278,25 @@ void ColumnString::getPermutation(bool reverse, size_t limit, int nan_direction_
 }
 
 
-ColumnPtr ColumnString::replicate(const Offsets_t & replicate_offsets) const
+ColumnPtr ColumnString::replicate(const Offsets & replicate_offsets) const
 {
     size_t col_size = size();
     if (col_size != replicate_offsets.size())
         throw Exception("Size of offsets doesn't match size of column.", ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
 
-    std::shared_ptr<ColumnString> res = std::make_shared<ColumnString>();
+    auto res = ColumnString::create();
 
     if (0 == col_size)
         return res;
 
-    Chars_t & res_chars = res->chars;
-    Offsets_t & res_offsets = res->offsets;
+    Chars & res_chars = res->chars;
+    Offsets & res_offsets = res->offsets;
     res_chars.reserve(chars.size() / col_size * replicate_offsets.back());
     res_offsets.reserve(replicate_offsets.back());
 
-    Offset_t prev_replicate_offset = 0;
-    Offset_t prev_string_offset = 0;
-    Offset_t current_new_offset = 0;
+    Offset prev_replicate_offset = 0;
+    Offset prev_string_offset = 0;
+    Offset current_new_offset = 0;
 
     for (size_t i = 0; i < col_size; ++i)
     {
@@ -247,10 +321,15 @@ ColumnPtr ColumnString::replicate(const Offsets_t & replicate_offsets) const
 }
 
 
+void ColumnString::gather(ColumnGathererStream & gatherer)
+{
+    gatherer.gather(*this);
+}
+
+
 void ColumnString::reserve(size_t n)
 {
     offsets.reserve(n);
-    chars.reserve(n * DBMS_APPROX_STRING_SIZE);
 }
 
 
@@ -258,6 +337,27 @@ void ColumnString::getExtremes(Field & min, Field & max) const
 {
     min = String();
     max = String();
+
+    size_t col_size = size();
+
+    if (col_size == 0)
+        return;
+
+    size_t min_idx = 0;
+    size_t max_idx = 0;
+
+    less<true> less_op(*this);
+
+    for (size_t i = 1; i < col_size; ++i)
+    {
+        if (less_op(i, min_idx))
+            min_idx = i;
+        else if (less_op(max_idx, i))
+            max_idx = i;
+    }
+
+    get(min_idx, min);
+    get(max_idx, max);
 }
 
 

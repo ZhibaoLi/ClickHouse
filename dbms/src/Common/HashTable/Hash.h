@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Core/Types.h>
+#include <Common/UInt128.h>
 
 
 /** Hash functions that are better than the trivial function std::hash.
@@ -34,14 +35,21 @@ inline DB::UInt64 intHash64(DB::UInt64 x)
   *  due to high speed (latency 3 + 1 clock cycle, throughput 1 clock cycle).
   * Works only with SSE 4.2 support.
   */
-#if __SSE4_2__
+#ifdef __SSE4_2__
 #include <nmmintrin.h>
+#endif
+
+#if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
+#include <arm_acle.h>
+#include <arm_neon.h>
 #endif
 
 inline DB::UInt64 intHashCRC32(DB::UInt64 x)
 {
-#if __SSE4_2__
+#ifdef __SSE4_2__
     return _mm_crc32_u64(-1ULL, x);
+#elif defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
+    return __crc32cd(-1U, x);
 #else
     /// On other platforms we do not have CRC32. NOTE This can be confusing.
     return intHash64(x);
@@ -115,6 +123,7 @@ DEFINE_HASH(DB::UInt8)
 DEFINE_HASH(DB::UInt16)
 DEFINE_HASH(DB::UInt32)
 DEFINE_HASH(DB::UInt64)
+DEFINE_HASH(DB::UInt128)
 DEFINE_HASH(DB::Int8)
 DEFINE_HASH(DB::Int16)
 DEFINE_HASH(DB::Int32)

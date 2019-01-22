@@ -2,63 +2,83 @@
 
 #include <ext/shared_ptr_helper.h>
 
-#include <Storages/StorageView.h>
+#include <Storages/IStorage.h>
 
 
 namespace DB
 {
 
-class StorageMaterializedView : public ext::shared_ptr_helper<StorageMaterializedView>, public StorageView
+class IAST; // XXX: should include full class - for proper use inside inline methods
+using ASTPtr = std::shared_ptr<IAST>;
+
+
+class StorageMaterializedView : public ext::shared_ptr_helper<StorageMaterializedView>, public IStorage
 {
-friend class ext::shared_ptr_helper<StorageMaterializedView>;
-
 public:
-    static StoragePtr create(
-        const String & table_name_,
-        const String & database_name_,
-        Context & context_,
-        ASTPtr & query_,
-        NamesAndTypesListPtr columns_,
-        const NamesAndTypesList & materialized_columns_,
-        const NamesAndTypesList & alias_columns_,
-        const ColumnDefaults & column_defaults_,
-        bool attach_);
-
     std::string getName() const override { return "MaterializedView"; }
-    std::string getInnerTableName() const { return  ".inner." + table_name; }
-    StoragePtr getInnerTable() const;
+    std::string getTableName() const override { return table_name; }
+    ASTPtr getInnerQuery() const { return inner_query->clone(); }
 
     NameAndTypePair getColumn(const String & column_name) const override;
     bool hasColumn(const String & column_name) const override;
 
-    bool supportsSampling() const override             { return getInnerTable()->supportsSampling(); }
-    bool supportsPrewhere() const override             { return getInnerTable()->supportsPrewhere(); }
-    bool supportsFinal() const override             { return getInnerTable()->supportsFinal(); }
-    bool supportsParallelReplicas() const override     { return getInnerTable()->supportsParallelReplicas(); }
-    bool supportsIndexForIn() const override         { return getInnerTable()->supportsIndexForIn(); }
+    bool supportsSampling() const override { return getTargetTable()->supportsSampling(); }
+    bool supportsPrewhere() const override { return getTargetTable()->supportsPrewhere(); }
+    bool supportsFinal() const override { return getTargetTable()->supportsFinal(); }
+    bool supportsIndexForIn() const override { return getTargetTable()->supportsIndexForIn(); }
+    bool mayBenefitFromIndexForIn(const ASTPtr & left_in_operand) const override { return getTargetTable()->mayBenefitFromIndexForIn(left_in_operand); }
 
     BlockOutputStreamPtr write(const ASTPtr & query, const Settings & settings) override;
     void drop() override;
-    bool optimize(const ASTPtr & query, const String & partition, bool final, bool deduplicate, const Settings & settings) override;
+
+    void truncate(const ASTPtr &, const Context &) override;
+
+    bool optimize(const ASTPtr & query, const ASTPtr & partition, bool final, bool deduplicate, const Context & context) override;
+
+    void alterPartition(const ASTPtr & query, const PartitionCommands & commands, const Context & context) override;
+
+    void mutate(const MutationCommands & commands, const Context & context) override;
+
+    void shutdown() override;
+
+    void checkTableCanBeDropped() const override;
+    void checkPartitionCanBeDropped(const ASTPtr & partition) override;
+
+    QueryProcessingStage::Enum getQueryProcessingStage(const Context & context) const override;
+
+    StoragePtr getTargetTable() const;
+    StoragePtr tryGetTargetTable() const;
 
     BlockInputStreams read(
         const Names & column_names,
-        const ASTPtr & query,
+        const SelectQueryInfo & query_info,
         const Context & context,
-        QueryProcessingStage::Enum & processed_stage,
+        QueryProcessingStage::Enum processed_stage,
         size_t max_block_size,
         unsigned num_streams) override;
 
+    String getDataPath() const override;
+
 private:
+    String select_database_name;
+    String select_table_name;
+    String target_database_name;
+    String target_table_name;
+    String table_name;
+    String database_name;
+    ASTPtr inner_query;
+    Context & global_context;
+    bool has_inner_table = false;
+
+    void checkStatementCanBeForwarded() const;
+
+protected:
     StorageMaterializedView(
         const String & table_name_,
         const String & database_name_,
-        Context & context_,
-        ASTPtr & query_,
-        NamesAndTypesListPtr columns_,
-        const NamesAndTypesList & materialized_columns_,
-        const NamesAndTypesList & alias_columns_,
-        const ColumnDefaults & column_defaults_,
+        Context & local_context,
+        const ASTCreateQuery & query,
+        const ColumnsDescription & columns_,
         bool attach_);
 };
 

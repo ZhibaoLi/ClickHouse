@@ -6,6 +6,7 @@
 #include <memory>
 #include <chrono>
 #include <Common/CurrentMetrics.h>
+#include <Common/Stopwatch.h>
 
 
 namespace CurrentMetrics
@@ -56,7 +57,10 @@ private:
         if (0 == priority)
             return true;
 
-        std::unique_lock<std::mutex> lock(mutex);
+        std::chrono::nanoseconds cur_timeout = timeout;
+        Stopwatch watch(CLOCK_MONOTONIC_COARSE);
+
+        std::unique_lock lock(mutex);
 
         while (true)
         {
@@ -78,8 +82,16 @@ private:
                 return true;
 
             CurrentMetrics::Increment metric_increment{CurrentMetrics::QueryPreempted};
-            if (std::cv_status::timeout == condvar.wait_for(lock, timeout))
+            if (std::cv_status::timeout == condvar.wait_for(lock, cur_timeout))
                 return false;
+            else
+            {
+                /// False awakening, check and update time limit
+                auto elapsed = std::chrono::nanoseconds(watch.elapsed());
+                if (elapsed >= timeout)
+                    return false;
+                cur_timeout = timeout - elapsed;
+            }
         }
     }
 
@@ -97,7 +109,7 @@ public:
         ~HandleImpl()
         {
             {
-                std::lock_guard<std::mutex> lock(parent.mutex);
+                std::lock_guard lock(parent.mutex);
                 --value.second;
             }
             parent.condvar.notify_all();
@@ -120,7 +132,7 @@ public:
         if (0 == priority)
             return {};
 
-        std::lock_guard<std::mutex> lock(mutex);
+        std::lock_guard lock(mutex);
         auto it = container.emplace(priority, 0).first;
         ++it->second;
         return std::make_shared<HandleImpl>(*this, *it);

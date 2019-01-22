@@ -1,100 +1,106 @@
 #include <Interpreters/InterpreterSelectQuery.h>
-#include <Parsers/ASTIdentifier.h>
+#include <Interpreters/InterpreterSelectWithUnionQuery.h>
 #include <Parsers/ASTCreateQuery.h>
-#include <Parsers/ASTSelectQuery.h>
+#include <Parsers/ASTSubquery.h>
 
 #include <Storages/StorageView.h>
+#include <Storages/StorageFactory.h>
 
+#include <DataStreams/MaterializingBlockInputStream.h>
+
+#include <Common/typeid_cast.h>
+#include <Interpreters/PredicateExpressionsOptimizer.h>
+#include <Parsers/ASTAsterisk.h>
+#include <iostream>
+#include <Parsers/queryToString.h>
 
 namespace DB
 {
 
 namespace ErrorCodes
 {
+    extern const int INCORRECT_QUERY;
     extern const int LOGICAL_ERROR;
 }
 
 
 StorageView::StorageView(
     const String & table_name_,
-    const String & database_name_,
-    Context & context_,
-    ASTPtr & query_,
-    NamesAndTypesListPtr columns_,
-    const NamesAndTypesList & materialized_columns_,
-    const NamesAndTypesList & alias_columns_,
-    const ColumnDefaults & column_defaults_)
-    : IStorage{materialized_columns_, alias_columns_, column_defaults_}, table_name(table_name_),
-    database_name(database_name_), context(context_), columns(columns_)
+    const ASTCreateQuery & query,
+    const ColumnsDescription & columns_)
+    : IStorage{columns_}, table_name(table_name_)
 {
-    ASTCreateQuery & create = typeid_cast<ASTCreateQuery &>(*query_);
-    ASTSelectQuery & select = typeid_cast<ASTSelectQuery &>(*create.select);
+    if (!query.select)
+        throw Exception("SELECT query is not specified for " + getName(), ErrorCodes::INCORRECT_QUERY);
 
-    /// If the internal query does not specify a database, retrieve it from the context and write it to the query.
-    select.setDatabaseIfNeeded(database_name);
-
-    inner_query = select;
-
-    extractDependentTable(inner_query);
-
-    if (!select_table_name.empty())
-        context.getGlobalContext().addDependency(
-            DatabaseAndTableName(select_database_name, select_table_name),
-            DatabaseAndTableName(database_name, table_name));
-}
-
-
-void StorageView::extractDependentTable(const ASTSelectQuery & query)
-{
-    auto query_table = query.table();
-
-    if (!query_table)
-        return;
-
-    if (const ASTIdentifier * ast_id = typeid_cast<const ASTIdentifier *>(query_table.get()))
-    {
-        auto query_database = query.database();
-
-        if (!query_database)
-            throw Exception("Logical error while creating StorageView."
-                " Could not retrieve database name from select query.",
-                DB::ErrorCodes::LOGICAL_ERROR);
-
-        select_database_name = typeid_cast<const ASTIdentifier &>(*query_database).name;
-        select_table_name = ast_id->name;
-    }
-    else if (const ASTSelectQuery * ast_select = typeid_cast<const ASTSelectQuery *>(query_table.get()))
-    {
-        extractDependentTable(*ast_select);
-    }
-    else
-        throw Exception("Logical error while creating StorageView."
-            " Could not retrieve table name from select query.",
-            DB::ErrorCodes::LOGICAL_ERROR);
+    inner_query = query.select->ptr();
 }
 
 
 BlockInputStreams StorageView::read(
     const Names & column_names,
-    const ASTPtr & query,
+    const SelectQueryInfo & query_info,
     const Context & context,
-    QueryProcessingStage::Enum & processed_stage,
-    const size_t max_block_size,
-    const unsigned num_streams)
+    QueryProcessingStage::Enum /*processed_stage*/,
+    const size_t /*max_block_size*/,
+    const unsigned /*num_streams*/)
 {
-    processed_stage = QueryProcessingStage::FetchColumns;
-    ASTPtr inner_query_clone = getInnerQuery();
-    return InterpreterSelectQuery(inner_query_clone, context, column_names).executeWithoutUnion();
+    BlockInputStreams res;
+
+    ASTPtr current_inner_query = inner_query;
+
+    if (context.getSettings().enable_optimize_predicate_expression)
+    {
+        auto new_inner_query = inner_query->clone();
+        auto new_outer_query = query_info.query->clone();
+        auto new_outer_select = typeid_cast<ASTSelectQuery *>(new_outer_query.get());
+
+        replaceTableNameWithSubquery(new_outer_select, new_inner_query);
+
+        if (PredicateExpressionsOptimizer(new_outer_select, context.getSettings(), context).optimize())
+            current_inner_query = new_inner_query;
+    }
+
+    res = InterpreterSelectWithUnionQuery(current_inner_query, context, column_names).executeWithMultipleStreams();
+
+    /// It's expected that the columns read from storage are not constant.
+    /// Because method 'getSampleBlockForColumns' is used to obtain a structure of result in InterpreterSelectQuery.
+    for (auto & stream : res)
+        stream = std::make_shared<MaterializingBlockInputStream>(stream);
+
+    return res;
+}
+
+void StorageView::replaceTableNameWithSubquery(ASTSelectQuery * select_query, ASTPtr & subquery)
+{
+    ASTTablesInSelectQueryElement * select_element = static_cast<ASTTablesInSelectQueryElement *>(select_query->tables->children[0].get());
+
+    if (!select_element->table_expression)
+        throw Exception("Logical error: incorrect table expression", ErrorCodes::LOGICAL_ERROR);
+
+    ASTTableExpression * table_expression = static_cast<ASTTableExpression *>(select_element->table_expression.get());
+
+    if (!table_expression->database_and_table_name)
+        throw Exception("Logical error: incorrect table expression", ErrorCodes::LOGICAL_ERROR);
+
+    const auto alias = table_expression->database_and_table_name->tryGetAlias();
+    table_expression->database_and_table_name = {};
+    table_expression->subquery = std::make_shared<ASTSubquery>();
+    table_expression->subquery->children.push_back(subquery);
+    if (!alias.empty())
+        table_expression->subquery->setAlias(alias);
 }
 
 
-void StorageView::drop()
+void registerStorageView(StorageFactory & factory)
 {
-    if (!select_table_name.empty())
-        context.getGlobalContext().removeDependency(
-            DatabaseAndTableName(select_database_name, select_table_name),
-            DatabaseAndTableName(database_name, table_name));
-}
+    factory.registerStorage("View", [](const StorageFactory::Arguments & args)
+    {
+        if (args.query.storage)
+            throw Exception("Specifying ENGINE is not allowed for a View", ErrorCodes::INCORRECT_QUERY);
 
+        return StorageView::create(args.table_name, args.query, args.columns);
+    });
+}
 
 }

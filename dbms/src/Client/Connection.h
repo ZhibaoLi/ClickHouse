@@ -1,5 +1,7 @@
 #pragma once
 
+#include <optional>
+
 #include <common/logger_useful.h>
 
 #include <Poco/Net/StreamSocket.h>
@@ -8,7 +10,7 @@
 
 #include <Core/Block.h>
 #include <Core/Defines.h>
-#include <Core/Progress.h>
+#include <IO/Progress.h>
 #include <Core/Protocol.h>
 #include <Core/QueryProcessingStage.h>
 
@@ -16,10 +18,15 @@
 #include <DataStreams/IBlockOutputStream.h>
 #include <DataStreams/BlockStreamProfileInfo.h>
 
+#include <IO/ConnectionTimeouts.h>
+
 #include <Interpreters/Settings.h>
 #include <Interpreters/TablesStatus.h>
 
+#include <Compression/ICompressionCodec.h>
+
 #include <atomic>
+#include <optional>
 
 
 namespace DB
@@ -50,20 +57,21 @@ class Connection : private boost::noncopyable
     friend class MultiplexedConnections;
 
 public:
-    Connection(const String & host_, UInt16 port_, const String & default_database_,
+    Connection(const String & host_, UInt16 port_,
+        const String & default_database_,
         const String & user_, const String & password_,
+        const ConnectionTimeouts & timeouts_,
         const String & client_name_ = "client",
-        Protocol::Compression::Enum compression_ = Protocol::Compression::Enable,
-        Poco::Timespan connect_timeout_ = Poco::Timespan(DBMS_DEFAULT_CONNECT_TIMEOUT_SEC, 0),
-        Poco::Timespan receive_timeout_ = Poco::Timespan(DBMS_DEFAULT_RECEIVE_TIMEOUT_SEC, 0),
-        Poco::Timespan send_timeout_ = Poco::Timespan(DBMS_DEFAULT_SEND_TIMEOUT_SEC, 0),
+        Protocol::Compression compression_ = Protocol::Compression::Enable,
+        Protocol::Secure secure_ = Protocol::Secure::Disable,
         Poco::Timespan sync_request_timeout_ = Poco::Timespan(DBMS_DEFAULT_SYNC_REQUEST_TIMEOUT_SEC, 0))
         :
         host(host_), port(port_), default_database(default_database_),
-        user(user_), password(password_), resolved_address(host, port),
+        user(user_), password(password_), current_resolved_address(host, port),
         client_name(client_name_),
         compression(compression_),
-        connect_timeout(connect_timeout_), receive_timeout(receive_timeout_), send_timeout(send_timeout_),
+        secure(secure_),
+        timeouts(timeouts_),
         sync_request_timeout(sync_request_timeout_),
         log_wrapper(*this)
     {
@@ -75,35 +83,7 @@ public:
         setDescription();
     }
 
-    Connection(const String & host_, UInt16 port_, const Poco::Net::SocketAddress & resolved_address_,
-        const String & default_database_,
-        const String & user_, const String & password_,
-        const String & client_name_ = "client",
-        Protocol::Compression::Enum compression_ = Protocol::Compression::Enable,
-        Poco::Timespan connect_timeout_ = Poco::Timespan(DBMS_DEFAULT_CONNECT_TIMEOUT_SEC, 0),
-        Poco::Timespan receive_timeout_ = Poco::Timespan(DBMS_DEFAULT_RECEIVE_TIMEOUT_SEC, 0),
-        Poco::Timespan send_timeout_ = Poco::Timespan(DBMS_DEFAULT_SEND_TIMEOUT_SEC, 0),
-        Poco::Timespan sync_request_timeout_ = Poco::Timespan(DBMS_DEFAULT_SYNC_REQUEST_TIMEOUT_SEC, 0))
-        :
-        host(host_), port(port_),
-        default_database(default_database_),
-        user(user_), password(password_),
-        resolved_address(resolved_address_),
-        client_name(client_name_),
-        compression(compression_),
-        connect_timeout(connect_timeout_), receive_timeout(receive_timeout_), send_timeout(send_timeout_),
-        sync_request_timeout(sync_request_timeout_),
-        log_wrapper(*this)
-    {
-        /// Don't connect immediately, only on first need.
-
-        if (user.empty())
-            user = "default";
-
-        setDescription();
-    }
-
-    virtual ~Connection() {};
+    virtual ~Connection() {}
 
     /// Set throttler of network traffic. One throttler could be used for multiple connections to limit total traffic.
     void setThrottler(const ThrottlerPtr & throttler_)
@@ -119,6 +99,7 @@ public:
 
         Block block;
         std::unique_ptr<Exception> exception;
+        std::vector<String> multistring_message;
         Progress progress;
         BlockStreamProfileInfo profile_info;
 
@@ -128,9 +109,11 @@ public:
     /// Change default database. Changes will take effect on next reconnect.
     void setDefaultDatabase(const String & database);
 
-    void getServerVersion(String & name, UInt64 & version_major, UInt64 & version_minor, UInt64 & revision);
+    void getServerVersion(String & name, UInt64 & version_major, UInt64 & version_minor, UInt64 & version_patch, UInt64 & revision);
+    UInt64 getServerRevision();
 
     const String & getServerTimezone();
+    const String & getServerDisplayName();
 
     /// For log and exception messages.
     const String & getDescription() const;
@@ -161,7 +144,10 @@ public:
     bool poll(size_t timeout_microseconds = 0);
 
     /// Check, if has data in read buffer.
-    bool hasReadBufferPendingData() const;
+    bool hasReadPendingData() const;
+
+    /// Checks if there is input data in connection and reads packet ID.
+    std::optional<UInt64> checkPacket(size_t timeout_microseconds = 0);
 
     /// Receive packet from server.
     Packet receivePacket();
@@ -177,13 +163,11 @@ public:
       */
     void disconnect();
 
-    /** Fill in the information that is needed when getting the block for some tasks
-      * (so far only for a DESCRIBE TABLE query with Distributed tables).
-      */
-    void fillBlockExtraInfo(BlockExtraInfo & info) const;
-
     size_t outBytesCount() const { return out ? out->count() : 0; }
     size_t inBytesCount() const { return in ? in->count() : 0; }
+
+    /// Returns initially resolved address
+    Poco::Net::SocketAddress getResolvedAddress() const;
 
 private:
     String host;
@@ -192,10 +176,9 @@ private:
     String user;
     String password;
 
-    /** Address could be resolved beforehand and passed to constructor. Then 'host' and 'port' fields are used just for logging.
-      * Otherwise address is resolved in constructor. Thus, DNS based load balancing is not supported.
-      */
-    Poco::Net::SocketAddress resolved_address;
+    /// Address is resolved during the first connection (or the following reconnects)
+    /// Use it only for logging purposes
+    Poco::Net::SocketAddress current_resolved_address;
 
     /// For messages in log and in exceptions.
     String description;
@@ -208,31 +191,35 @@ private:
     String server_name;
     UInt64 server_version_major = 0;
     UInt64 server_version_minor = 0;
+    UInt64 server_version_patch = 0;
     UInt64 server_revision = 0;
     String server_timezone;
+    String server_display_name;
 
-    Poco::Net::StreamSocket socket;
+    std::unique_ptr<Poco::Net::StreamSocket> socket;
     std::shared_ptr<ReadBuffer> in;
     std::shared_ptr<WriteBuffer> out;
+    std::optional<UInt64> last_input_packet_type;
 
     String query_id;
-    UInt64 compression;        /// Enable data compression for communication.
-    /// What compression algorithm to use while sending data for INSERT queries and external tables.
-    CompressionMethod network_compression_method = CompressionMethod::LZ4;
+    Protocol::Compression compression;        /// Enable data compression for communication.
+    Protocol::Secure secure;             /// Enable data encryption for communication.
+
+    /// What compression settings to use while sending data for INSERT queries and external tables.
+    CompressionCodecPtr compression_codec;
 
     /** If not nullptr, used to limit network traffic.
       * Only traffic for transferring blocks is accounted. Other packets don't.
       */
     ThrottlerPtr throttler;
 
-    Poco::Timespan connect_timeout;
-    Poco::Timespan receive_timeout;
-    Poco::Timespan send_timeout;
+    ConnectionTimeouts timeouts;
     Poco::Timespan sync_request_timeout;
 
     /// From where to read query execution result.
     std::shared_ptr<ReadBuffer> maybe_compressed_in;
     BlockInputStreamPtr block_in;
+    BlockInputStreamPtr block_logs_in;
 
     /// Where to write data for INSERT.
     std::shared_ptr<WriteBuffer> maybe_compressed_out;
@@ -268,11 +255,17 @@ private:
     bool ping();
 
     Block receiveData();
+    Block receiveLogData();
+    Block receiveDataImpl(BlockInputStreamPtr & stream);
+
+    std::vector<String> receiveMultistringMessage(UInt64 msg_type);
     std::unique_ptr<Exception> receiveException();
     Progress receiveProgress();
     BlockStreamProfileInfo receiveProfileInfo();
 
+    void initInputBuffers();
     void initBlockInput();
+    void initBlockLogsInput();
 
     void throwUnexpectedPacket(UInt64 packet_type, const char * expected) const;
 };

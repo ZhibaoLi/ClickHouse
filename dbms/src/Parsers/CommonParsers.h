@@ -5,28 +5,6 @@
 namespace DB
 {
 
-/** If right now is not `s`, then an error.
-  * If word_boundary is set to true, and the last character of the string - word (\w),
-  *  then it is checked that the next character in the string is not a word character.
-  */
-class ParserString : public IParserBase
-{
-private:
-    const char * s;
-    size_t s_size;
-    bool word_boundary;
-    bool case_insensitive;
-
-public:
-    ParserString(const char * s_, bool word_boundary_ = false, bool case_insensitive_ = false);
-
-protected:
-    const char * getName() const override;
-
-    bool parseImpl(Pos & pos, Pos end, ASTPtr & node, Pos & max_parsed_pos, Expected & expected) override;
-};
-
-
 /** Parse specified keyword such as SELECT or compound keyword such as ORDER BY.
   * All case insensitive. Requires word boundary.
   * For compound keywords, any whitespace characters and comments could be in the middle.
@@ -43,66 +21,123 @@ public:
 protected:
     const char * getName() const override;
 
-    bool parseImpl(Pos & pos, Pos end, ASTPtr & node, Pos & max_parsed_pos, Expected & expected) override;
+    bool parseImpl(Pos & pos, ASTPtr & node, Expected & expected) override;
 };
 
 
-/** whitespace characters
-  */
-class ParserWhitespace : public IParserBase
+class ParserToken : public IParserBase
+{
+private:
+    TokenType token_type;
+public:
+    ParserToken(TokenType token_type) : token_type(token_type) {}
+protected:
+    const char * getName() const override { return "token"; }
+
+    bool parseImpl(Pos & pos, ASTPtr & /*node*/, Expected & expected) override
+    {
+        if (pos->type != token_type)
+        {
+            expected.add(pos, getTokenName(token_type));
+            return false;
+        }
+        ++pos;
+        return true;
+    }
+};
+
+class ParserInterval: public IParserBase
 {
 public:
-    ParserWhitespace(bool allow_newlines_ = true);
+    enum class IntervalKind
+    {
+        Incorrect,
+        Second,
+        Minute,
+        Hour,
+        Day,
+        Week,
+        Month,
+        Quarter,
+        Year
+    };
+
+    IntervalKind interval_kind;
+
+    ParserInterval() : interval_kind(IntervalKind::Incorrect) {}
+
+    const char * getToIntervalKindFunctionName()
+    {
+        switch (interval_kind)
+        {
+            case ParserInterval::IntervalKind::Second:
+                return "toIntervalSecond";
+            case ParserInterval::IntervalKind::Minute:
+                return "toIntervalMinute";
+            case ParserInterval::IntervalKind::Hour:
+                return "toIntervalHour";
+            case ParserInterval::IntervalKind::Day:
+                return "toIntervalDay";
+            case ParserInterval::IntervalKind::Week:
+                return "toIntervalWeek";
+            case ParserInterval::IntervalKind::Month:
+                return "toIntervalMonth";
+            case ParserInterval::IntervalKind::Quarter:
+                return "toIntervalQuarter";
+            case ParserInterval::IntervalKind::Year:
+                return "toIntervalYear";
+            default:
+                return nullptr;
+        }
+    }
 
 protected:
-    bool allow_newlines;
+    const char * getName() const override { return "interval"; }
 
-    const char * getName() const override;
+    bool parseImpl(Pos & pos, ASTPtr & /*node*/, Expected & expected) override
+    {
+        if (ParserKeyword("SECOND").ignore(pos, expected) || ParserKeyword("SQL_TSI_SECOND").ignore(pos, expected)
+            || ParserKeyword("SS").ignore(pos, expected) || ParserKeyword("S").ignore(pos, expected))
+            interval_kind = IntervalKind::Second;
+        else if (
+            ParserKeyword("MINUTE").ignore(pos, expected) || ParserKeyword("SQL_TSI_MINUTE").ignore(pos, expected)
+            || ParserKeyword("MI").ignore(pos, expected) || ParserKeyword("N").ignore(pos, expected))
+            interval_kind = IntervalKind::Minute;
+        else if (
+            ParserKeyword("HOUR").ignore(pos, expected) || ParserKeyword("SQL_TSI_HOUR").ignore(pos, expected)
+            || ParserKeyword("HH").ignore(pos, expected))
+            interval_kind = IntervalKind::Hour;
+        else if (
+            ParserKeyword("DAY").ignore(pos, expected) || ParserKeyword("SQL_TSI_DAY").ignore(pos, expected)
+            || ParserKeyword("DD").ignore(pos, expected) || ParserKeyword("D").ignore(pos, expected))
+            interval_kind = IntervalKind::Day;
+        else if (
+            ParserKeyword("WEEK").ignore(pos, expected) || ParserKeyword("SQL_TSI_WEEK").ignore(pos, expected)
+            || ParserKeyword("WK").ignore(pos, expected) || ParserKeyword("WW").ignore(pos, expected))
+            interval_kind = IntervalKind::Week;
+        else if (
+            ParserKeyword("MONTH").ignore(pos, expected) || ParserKeyword("SQL_TSI_MONTH").ignore(pos, expected)
+            || ParserKeyword("MM").ignore(pos, expected) || ParserKeyword("M").ignore(pos, expected))
+            interval_kind = IntervalKind::Month;
+        else if (
+            ParserKeyword("QUARTER").ignore(pos, expected) || ParserKeyword("SQL_TSI_QUARTER").ignore(pos, expected)
+            || ParserKeyword("QQ").ignore(pos, expected) || ParserKeyword("Q").ignore(pos, expected))
+            interval_kind = IntervalKind::Quarter;
+        else if (
+            ParserKeyword("YEAR").ignore(pos, expected) || ParserKeyword("SQL_TSI_YEAR").ignore(pos, expected)
+            || ParserKeyword("YYYY").ignore(pos, expected) || ParserKeyword("YY").ignore(pos, expected))
+            interval_kind = IntervalKind::Year;
+        else
+            interval_kind = IntervalKind::Incorrect;
 
-    bool parseImpl(Pos & pos, Pos end, ASTPtr & node, Pos & max_parsed_pos, Expected & expected) override;
-};
-
-
-class ParserCStyleComment : public IParserBase
-{
-protected:
-    const char * getName() const override;
-
-    bool parseImpl(Pos & pos, Pos end, ASTPtr & node, Pos & max_parsed_pos, Expected & expected) override;
-};
-
-
-class ParserSQLStyleComment : public IParserBase
-{
-protected:
-    const char * getName() const override;
-
-    bool parseImpl(Pos & pos, Pos end, ASTPtr & node, Pos & max_parsed_pos, Expected & expected) override;
-};
-
-
-/** comments '--' or c-style
-  */
-class ParserComment : public IParserBase
-{
-protected:
-    const char * getName() const override;
-
-    bool parseImpl(Pos & pos, Pos end, ASTPtr & node, Pos & max_parsed_pos, Expected & expected) override;
-};
-
-
-class ParserWhitespaceOrComments : public IParserBase
-{
-public:
-    ParserWhitespaceOrComments(bool allow_newlines_outside_comments_ = true);
-
-protected:
-    bool allow_newlines_outside_comments;
-
-    const char * getName() const override;
-
-    bool parseImpl(Pos & pos, Pos end, ASTPtr & node, Pos & max_parsed_pos, Expected & expected) override;
+        if (interval_kind == IntervalKind::Incorrect)
+        {
+            expected.add(pos, "YEAR, QUARTER, MONTH, WEEK, DAY, HOUR, MINUTE or SECOND");
+            return false;
+        }
+        /// one of ParserKeyword already made ++pos
+        return true;
+    }
 };
 
 }

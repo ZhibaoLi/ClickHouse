@@ -1,10 +1,8 @@
 #pragma once
 
 #include <string>
+#include <IO/WriteBufferFromVector.h>
 
-#include <IO/WriteBuffer.h>
-
-#define WRITE_BUFFER_FROM_STRING_INITIAL_SIZE_IF_EMPTY 32
 
 namespace DB
 {
@@ -12,38 +10,29 @@ namespace DB
 /** Writes the data to a string.
   * Note: before using the resulting string, destroy this object.
   */
-class WriteBufferFromString : public WriteBuffer
+using WriteBufferFromString = WriteBufferFromVector<std::string>;
+
+
+namespace detail
 {
-private:
-    std::string & s;
-
-    void nextImpl() override
+    /// For correct order of initialization.
+    class StringHolder
     {
-        size_t old_size = s.size();
-        s.resize(old_size * 2);
-        internal_buffer = Buffer(reinterpret_cast<Position>(&s[old_size]), reinterpret_cast<Position>(&*s.end()));
-        working_buffer = internal_buffer;
-    }
+    protected:
+        std::string value;
+    };
+}
 
-    void finish()
-    {
-        s.resize(count());
-    }
-
+/// Creates the string by itself and allows to get it.
+class WriteBufferFromOwnString : public detail::StringHolder, public WriteBufferFromString
+{
 public:
-    WriteBufferFromString(std::string & s_)
-        : WriteBuffer(reinterpret_cast<Position>(&s_[0]), s_.size()), s(s_)
-    {
-        if (s.empty())
-        {
-            s.resize(WRITE_BUFFER_FROM_STRING_INITIAL_SIZE_IF_EMPTY);
-            set(reinterpret_cast<Position>(&s[0]), s.size());
-        }
-    }
+    WriteBufferFromOwnString() : WriteBufferFromString(value) {}
 
-    ~WriteBufferFromString() override
+    std::string & str()
     {
         finish();
+        return value;
     }
 };
 

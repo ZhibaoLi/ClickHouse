@@ -6,7 +6,8 @@
 #include <Parsers/parseQuery.h>
 
 
-int main(int argc, char ** argv)
+int main(int, char **)
+try
 {
     using namespace DB;
 
@@ -22,12 +23,16 @@ int main(int argc, char ** argv)
         " FORMAT TabSeparated";
 
     ParserQueryWithOutput parser;
-    ASTPtr ast = parseQuery(parser, input.data(), input.data() + input.size(), "");
+    ASTPtr ast = parseQuery(parser, input.data(), input.data() + input.size(), "", 0);
 
     std::cout << "Success." << std::endl;
     formatAST(*ast, std::cerr);
     std::cout << std::endl;
-    std::cout << std::endl << ast->getTreeID() << std::endl;
 
     return 0;
+}
+catch (...)
+{
+    std::cerr << DB::getCurrentExceptionMessage(true) << "\n";
+    return 1;
 }

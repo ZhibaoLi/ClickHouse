@@ -14,7 +14,7 @@
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
 #include <Common/SimpleCache.h>
-#include <Common/StringUtils.h>
+#include <Common/StringUtils/StringUtils.h>
 #include <Interpreters/Users.h>
 
 #include <openssl/sha.h>
@@ -48,14 +48,15 @@ static Poco::Net::IPAddress toIPv6(const Poco::Net::IPAddress addr)
 }
 
 
-/// IP-address or subnet mask. Example: 213.180.204.3 or 10.0.0.1/8 or 2a02:6b8::3 or 2a02:6b8::3/64.
+/// IP-address or subnet mask. Example: 213.180.204.3 or 10.0.0.1/8 or 312.234.1.1/255.255.255.0
+/// 2a02:6b8::3 or 2a02:6b8::3/64 or 2a02:6b8::3/FFFF:FFFF:FFFF:FFFF::
 class IPAddressPattern : public IAddressPattern
 {
 private:
     /// Address of mask. Always transformed to IPv6.
     Poco::Net::IPAddress mask_address;
-    /// Number of bits in mask.
-    UInt8 prefix_bits;
+    /// Mask of net (ip form). Always transformed to IPv6.
+    Poco::Net::IPAddress subnet_mask;
 
 public:
     explicit IPAddressPattern(const String & str)
@@ -69,43 +70,59 @@ public:
         else
         {
             String addr(str, 0, pos - str.c_str());
-            UInt8 prefix_bits_ = parse<UInt8>(pos + 1);
+            auto real_address = Poco::Net::IPAddress(addr);
 
-            construct(Poco::Net::IPAddress(addr), prefix_bits_);
+            String str_mask(str, addr.length() + 1, str.length() - addr.length() - 1);
+            if (isDigits(str_mask))
+            {
+                UInt8 prefix_bits = parse<UInt8>(pos + 1);
+                construct(prefix_bits, real_address.family() == Poco::Net::AddressFamily::IPv4);
+            }
+            else
+            {
+                subnet_mask = netmaskToIPv6(Poco::Net::IPAddress(str_mask));
+            }
+
+            mask_address = toIPv6(real_address);
         }
     }
 
     bool contains(const Poco::Net::IPAddress & addr) const override
     {
-        return prefixBitsEquals(reinterpret_cast<const char *>(toIPv6(addr).addr()), reinterpret_cast<const char *>(mask_address.addr()), prefix_bits);
+        return prefixBitsEquals(addr, mask_address, subnet_mask);
     }
 
 private:
     void construct(const Poco::Net::IPAddress & mask_address_)
     {
         mask_address = toIPv6(mask_address_);
-        prefix_bits = 128;
+        subnet_mask = Poco::Net::IPAddress(128, Poco::Net::IPAddress::IPv6);
     }
 
-    void construct(const Poco::Net::IPAddress & mask_address_, UInt8 prefix_bits_)
+    void construct(UInt8 prefix_bits, bool is_ipv4)
     {
-        mask_address = toIPv6(mask_address_);
-        prefix_bits = mask_address_.family() == Poco::Net::IPAddress::IPv4
-            ? prefix_bits_ + 96
-            : prefix_bits_;
+        prefix_bits = is_ipv4 ? prefix_bits + 96 : prefix_bits;
+        subnet_mask = Poco::Net::IPAddress(prefix_bits, Poco::Net::IPAddress::IPv6);
     }
 
-    static bool prefixBitsEquals(const char * lhs, const char * rhs, UInt8 prefix_bits)
+    static bool prefixBitsEquals(const Poco::Net::IPAddress & ip_address, const Poco::Net::IPAddress & net_address, const Poco::Net::IPAddress & mask)
     {
-        UInt8 prefix_bytes = prefix_bits / 8;
-        UInt8 remaining_bits = prefix_bits % 8;
+        return ((toIPv6(ip_address) & mask) == (toIPv6(net_address) & mask));
+    }
 
-        return 0 == memcmp(lhs, rhs, prefix_bytes)
-            && (remaining_bits % 8 == 0
-                 || (lhs[prefix_bytes] >> (8 - remaining_bits)) == (rhs[prefix_bytes] >> (8 - remaining_bits)));
+    static bool isDigits(const std::string & str)
+    {
+        return std::all_of(str.begin(), str.end(), isNumericASCII);
+    }
+
+    static Poco::Net::IPAddress netmaskToIPv6(Poco::Net::IPAddress mask)
+    {
+        if (mask.family() == Poco::Net::IPAddress::IPv6)
+            return mask;
+
+        return Poco::Net::IPAddress(96, Poco::Net::IPAddress::IPv6) | toIPv6(mask);
     }
 };
-
 
 /// Check that address equals to one of hostname addresses.
 class HostExactPattern : public IAddressPattern
@@ -162,7 +179,7 @@ private:
     }
 
 public:
-    HostExactPattern(const String & host_) : host(host_) {}
+    explicit HostExactPattern(const String & host_) : host(host_) {}
 
     bool contains(const Poco::Net::IPAddress & addr) const override
     {
@@ -192,7 +209,7 @@ private:
     }
 
 public:
-    HostRegexpPattern(const String & host_regexp_) : host_regexp(host_regexp_) {}
+    explicit HostRegexpPattern(const String & host_regexp_) : host_regexp(host_regexp_) {}
 
     bool contains(const Poco::Net::IPAddress & addr) const override
     {
@@ -237,7 +254,7 @@ bool AddressPatterns::contains(const Poco::Net::IPAddress & addr) const
     return false;
 }
 
-void AddressPatterns::addFromConfig(const String & config_elem, Poco::Util::AbstractConfiguration & config)
+void AddressPatterns::addFromConfig(const String & config_elem, const Poco::Util::AbstractConfiguration & config)
 {
     Poco::Util::AbstractConfiguration::Keys config_keys;
     config.keys(config_elem, config_keys);
@@ -261,7 +278,7 @@ void AddressPatterns::addFromConfig(const String & config_elem, Poco::Util::Abst
 }
 
 
-User::User(const String & name_, const String & config_elem, Poco::Util::AbstractConfiguration & config)
+User::User(const String & name_, const String & config_elem, const Poco::Util::AbstractConfiguration & config)
     : name(name_)
 {
     bool has_password = config.has(config_elem + ".password");
@@ -284,8 +301,8 @@ User::User(const String & name_, const String & config_elem, Poco::Util::Abstrac
             throw Exception("password_sha256_hex for user " + name + " has length " + toString(password_sha256_hex.size()) + " but must be exactly 64 symbols.", ErrorCodes::BAD_ARGUMENTS);
     }
 
-    profile     = config.getString(config_elem + ".profile");
-    quota         = config.getString(config_elem + ".quota");
+    profile = config.getString(config_elem + ".profile");
+    quota = config.getString(config_elem + ".quota");
 
     addresses.addFromConfig(config_elem + ".networks", config);
 
@@ -303,87 +320,6 @@ User::User(const String & name_, const String & config_elem, Poco::Util::Abstrac
             databases.insert(database_name);
         }
     }
-}
-
-
-void Users::loadFromConfig(Poco::Util::AbstractConfiguration & config)
-{
-    cont.clear();
-
-    Poco::Util::AbstractConfiguration::Keys config_keys;
-    config.keys("users", config_keys);
-
-    for (const std::string & key : config_keys)
-        cont[key] = User(key, "users." + key, config);
-}
-
-const User & Users::get(const String & user_name, const String & password, const Poco::Net::IPAddress & address) const
-{
-    auto it = cont.find(user_name);
-
-    if (cont.end() == it)
-        throw Exception("Unknown user " + user_name, ErrorCodes::UNKNOWN_USER);
-
-    if (!it->second.addresses.contains(address))
-        throw Exception("User " + user_name + " is not allowed to connect from address " + address.toString(), ErrorCodes::IP_ADDRESS_NOT_ALLOWED);
-
-    auto on_wrong_password = [&]()
-    {
-        if (password.empty())
-            throw Exception("Password required for user " + user_name, ErrorCodes::REQUIRED_PASSWORD);
-        else
-            throw Exception("Wrong password for user " + user_name, ErrorCodes::WRONG_PASSWORD);
-    };
-
-    if (!it->second.password_sha256_hex.empty())
-    {
-        unsigned char hash[32];
-
-        SHA256_CTX ctx;
-        SHA256_Init(&ctx);
-        SHA256_Update(&ctx, reinterpret_cast<const unsigned char *>(password.data()), password.size());
-        SHA256_Final(hash, &ctx);
-
-        String hash_hex;
-        {
-            WriteBufferFromString buf(hash_hex);
-            HexWriteBuffer hex_buf(buf);
-            hex_buf.write(reinterpret_cast<const char *>(hash), sizeof(hash));
-        }
-
-        Poco::toLowerInPlace(hash_hex);
-
-        if (hash_hex != it->second.password_sha256_hex)
-            on_wrong_password();
-    }
-    else if (password != it->second.password)
-    {
-        on_wrong_password();
-    }
-
-    return it->second;
-}
-
-
-const User & Users::get(const String & user_name)
-{
-    auto it = cont.find(user_name);
-
-    if (cont.end() == it)
-        throw Exception("Unknown user " + user_name, ErrorCodes::UNKNOWN_USER);
-
-    return it->second;
-}
-
-
-bool Users::isAllowedDatabase(const std::string & user_name, const std::string & database_name) const
-{
-    auto it = cont.find(user_name);
-    if (it == cont.end())
-        throw Exception("Unknown user " + user_name, ErrorCodes::UNKNOWN_USER);
-
-    const auto & user = it->second;
-    return user.databases.empty() || user.databases.count(database_name);
 }
 
 

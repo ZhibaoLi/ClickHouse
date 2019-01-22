@@ -6,15 +6,19 @@
 namespace DB
 {
 
-/** Empty stream of blocks.
+/** Empty stream of blocks of specified structure.
   */
 class NullBlockInputStream : public IBlockInputStream
 {
 public:
-    Block read() override { return Block(); }
+    NullBlockInputStream(const Block & header) : header(header) {}
+
+    Block read() override { return {}; }
+    Block getHeader() const override { return header; }
     String getName() const override { return "Null"; }
 
-    String getID() const override;
+private:
+    Block header;
 };
 
 }

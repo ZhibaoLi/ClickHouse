@@ -1,7 +1,7 @@
 #pragma once
 
+#include <type_traits>
 #include <DataTypes/DataTypeNumberBase.h>
-#include <DataTypes/IDataTypeDummy.h>
 
 
 namespace DB
@@ -10,7 +10,13 @@ namespace DB
 template <typename T>
 class DataTypeNumber final : public DataTypeNumberBase<T>
 {
-    DataTypePtr clone() const override { return std::make_shared<DataTypeNumber<T>>(); }
+    bool equals(const IDataType & rhs) const override { return typeid(rhs) == typeid(*this); }
+
+    bool canBeUsedAsVersion() const override { return true; }
+    bool isSummable() const override { return true; }
+    bool canBeUsedInBitOperations() const override { return true; }
+    bool canBeUsedInBooleanContext() const override { return true; }
+    bool canBeInsideNullable() const override { return true; }
 };
 
 using DataTypeUInt8 = DataTypeNumber<UInt8>;
@@ -24,29 +30,16 @@ using DataTypeInt64 = DataTypeNumber<Int64>;
 using DataTypeFloat32 = DataTypeNumber<Float32>;
 using DataTypeFloat64 = DataTypeNumber<Float64>;
 
-
-/// Used only to indicate error case in calculations on data types.
-
-template <>
-class DataTypeNumber<void> final : public IDataTypeDummy
-{
-public:
-    using FieldType = void;
-
-    std::string getName() const override { return "Void"; }
-    DataTypePtr clone() const override { return std::make_shared<DataTypeNumber<void>>(); }
-};
-
-using DataTypeVoid = DataTypeNumber<void>;
-
-template <>
-class DataTypeNumber<Null> final : public IDataTypeDummy
-{
-public:
-    using FieldType = Null;
-
-    std::string getName() const override { return "Null"; }
-    DataTypePtr clone() const override { return std::make_shared<DataTypeNumber<Null>>(); }
-};
+template <typename DataType> constexpr bool IsDataTypeNumber = false;
+template <> constexpr bool IsDataTypeNumber<DataTypeNumber<UInt8>> = true;
+template <> constexpr bool IsDataTypeNumber<DataTypeNumber<UInt16>> = true;
+template <> constexpr bool IsDataTypeNumber<DataTypeNumber<UInt32>> = true;
+template <> constexpr bool IsDataTypeNumber<DataTypeNumber<UInt64>> = true;
+template <> constexpr bool IsDataTypeNumber<DataTypeNumber<Int8>> = true;
+template <> constexpr bool IsDataTypeNumber<DataTypeNumber<Int16>> = true;
+template <> constexpr bool IsDataTypeNumber<DataTypeNumber<Int32>> = true;
+template <> constexpr bool IsDataTypeNumber<DataTypeNumber<Int64>> = true;
+template <> constexpr bool IsDataTypeNumber<DataTypeNumber<Float32>> = true;
+template <> constexpr bool IsDataTypeNumber<DataTypeNumber<Float64>> = true;
 
 }

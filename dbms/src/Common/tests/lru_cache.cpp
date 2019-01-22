@@ -5,12 +5,14 @@
 #include <string>
 #include <thread>
 #include <chrono>
+#include <functional>
+
 
 namespace
 {
 
 void run();
-void runTest(unsigned int num, const std::function<bool()> func);
+void runTest(unsigned int num, const std::function<bool()> & func);
 bool test1();
 bool test2();
 bool test_concurrent();
@@ -29,7 +31,7 @@ while (0)
 
 void run()
 {
-    const std::vector<std::function<bool()> > tests =
+    const std::vector<std::function<bool()>> tests =
     {
         test1,
         test2,
@@ -44,7 +46,7 @@ void run()
     }
 }
 
-void runTest(unsigned int num, const std::function<bool()> func)
+void runTest(unsigned int num, const std::function<bool()> & func)
 {
     bool ok;
 
@@ -188,7 +190,7 @@ bool test_concurrent()
 
     bool res = true;
 
-    auto load_func = [](const std::string& result, std::chrono::seconds sleep_for, bool throw_exc)
+    auto load_func = [](const std::string & result, std::chrono::seconds sleep_for, bool throw_exc)
     {
         std::this_thread::sleep_for(sleep_for);
         if (throw_exc)

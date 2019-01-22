@@ -12,16 +12,15 @@ namespace DB
 class CountingBlockOutputStream : public IBlockOutputStream
 {
 public:
-
     CountingBlockOutputStream(const BlockOutputStreamPtr & stream_)
         : stream(stream_) {}
 
-    void setProgressCallback(ProgressCallback callback)
+    void setProgressCallback(const ProgressCallback & callback)
     {
         progress_callback = callback;
     }
 
-    void setProcessListElement(ProcessListElement * elem)
+    void setProcessListElement(QueryStatus * elem)
     {
         process_elem = elem;
     }
@@ -31,20 +30,20 @@ public:
         return progress;
     }
 
+    Block getHeader() const override { return stream->getHeader(); }
     void write(const Block & block) override;
 
     void writePrefix() override                         { stream->writePrefix(); }
     void writeSuffix() override                         { stream->writeSuffix(); }
-    void flush() override                                 { stream->flush(); }
-    void onProgress(const Progress & progress) override { stream->onProgress(progress); }
-    String getContentType() const override                { return stream->getContentType(); }
+    void flush() override                               { stream->flush(); }
+    void onProgress(const Progress & current_progress) override { stream->onProgress(current_progress); }
+    String getContentType() const override              { return stream->getContentType(); }
 
 protected:
-
     BlockOutputStreamPtr stream;
     Progress progress;
     ProgressCallback progress_callback;
-    ProcessListElement * process_elem = nullptr;
+    QueryStatus * process_elem = nullptr;
 };
 
 }

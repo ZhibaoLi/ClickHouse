@@ -1,20 +1,22 @@
+#include "ColumnVector.h"
+
 #include <cstring>
 #include <cmath>
-
+#include <common/unaligned.h>
 #include <Common/Exception.h>
 #include <Common/Arena.h>
 #include <Common/SipHash.h>
 #include <Common/NaNUtils.h>
-
 #include <IO/WriteBuffer.h>
 #include <IO/WriteHelpers.h>
-
-#include <Columns/ColumnVector.h>
-
+#include <Columns/ColumnsCommon.h>
+#include <DataStreams/ColumnGathererStream.h>
 #include <ext/bit_cast.h>
 
-#if __SSE2__
+#ifdef __SSE2__
     #include <emmintrin.h>
+#include <Columns/ColumnsCommon.h>
+
 #endif
 
 
@@ -32,21 +34,21 @@ template <typename T>
 StringRef ColumnVector<T>::serializeValueIntoArena(size_t n, Arena & arena, char const *& begin) const
 {
     auto pos = arena.allocContinue(sizeof(T), begin);
-    memcpy(pos, &data[n], sizeof(T));
+    unalignedStore(pos, data[n]);
     return StringRef(pos, sizeof(T));
 }
 
 template <typename T>
 const char * ColumnVector<T>::deserializeAndInsertFromArena(const char * pos)
 {
-    data.push_back(*reinterpret_cast<const T *>(pos));
+    data.push_back(unalignedLoad<T>(pos));
     return pos + sizeof(T);
 }
 
 template <typename T>
 void ColumnVector<T>::updateHashWithValue(size_t n, SipHash & hash) const
 {
-    hash.update(reinterpret_cast<const char *>(&data[n]), sizeof(T));
+    hash.update(data[n]);
 }
 
 template <typename T>
@@ -68,7 +70,7 @@ struct ColumnVector<T>::greater
 };
 
 template <typename T>
-void ColumnVector<T>::getPermutation(bool reverse, size_t limit, int nan_direction_hint, Permutation & res) const
+void ColumnVector<T>::getPermutation(bool reverse, size_t limit, int nan_direction_hint, IColumn::Permutation & res) const
 {
     size_t s = data.size();
     res.resize(s);
@@ -95,29 +97,29 @@ void ColumnVector<T>::getPermutation(bool reverse, size_t limit, int nan_directi
 }
 
 template <typename T>
-std::string ColumnVector<T>::getName() const
+const char * ColumnVector<T>::getFamilyName() const
 {
-    return "ColumnVector<" + TypeName<T>::get() + ">";
+    return TypeName<T>::get();
 }
 
 template <typename T>
-ColumnPtr ColumnVector<T>::cloneResized(size_t size) const
+MutableColumnPtr ColumnVector<T>::cloneResized(size_t size) const
 {
-    ColumnPtr new_col_holder = std::make_shared<Self>();
+    auto res = this->create();
 
     if (size > 0)
     {
-        auto & new_col = static_cast<Self &>(*new_col_holder);
+        auto & new_col = static_cast<Self &>(*res);
         new_col.data.resize(size);
 
         size_t count = std::min(this->size(), size);
-        memcpy(&new_col.data[0], &data[0], count * sizeof(data[0]));
+        memcpy(new_col.data.data(), data.data(), count * sizeof(data[0]));
 
         if (size > count)
-            memset(&new_col.data[count], value_type(), size - count);
+            memset(static_cast<void *>(&new_col.data[count]), static_cast<int>(value_type()), (size - count) * sizeof(value_type));
     }
 
-    return new_col_holder;
+    return res;
 }
 
 template <typename T>
@@ -150,17 +152,17 @@ ColumnPtr ColumnVector<T>::filter(const IColumn::Filter & filt, ssize_t result_s
     if (size != filt.size())
         throw Exception("Size of filter doesn't match size of column.", ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
 
-    std::shared_ptr<Self> res = std::make_shared<Self>();
-    typename Self::Container_t & res_data = res->getData();
+    auto res = this->create();
+    Container & res_data = res->getData();
 
     if (result_size_hint)
         res_data.reserve(result_size_hint > 0 ? result_size_hint : size);
 
-    const UInt8 * filt_pos = &filt[0];
+    const UInt8 * filt_pos = filt.data();
     const UInt8 * filt_end = filt_pos + size;
-    const T * data_pos = &data[0];
+    const T * data_pos = data.data();
 
-#if __SSE2__
+#ifdef __SSE2__
     /** A slightly more optimized version.
         * Based on the assumption that often pieces of consecutive values
         *  completely pass or do not pass the filter.
@@ -220,8 +222,8 @@ ColumnPtr ColumnVector<T>::permute(const IColumn::Permutation & perm, size_t lim
     if (perm.size() < limit)
         throw Exception("Size of permutation is less than required.", ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
 
-    std::shared_ptr<Self> res = std::make_shared<Self>(limit);
-    typename Self::Container_t & res_data = res->getData();
+    auto res = this->create(limit);
+    typename Self::Container & res_data = res->getData();
     for (size_t i = 0; i < limit; ++i)
         res_data[i] = data[perm[i]];
 
@@ -229,20 +231,26 @@ ColumnPtr ColumnVector<T>::permute(const IColumn::Permutation & perm, size_t lim
 }
 
 template <typename T>
-ColumnPtr ColumnVector<T>::replicate(const IColumn::Offsets_t & offsets) const
+ColumnPtr ColumnVector<T>::index(const IColumn & indexes, size_t limit) const
+{
+    return selectIndexImpl(*this, indexes, limit);
+}
+
+template <typename T>
+ColumnPtr ColumnVector<T>::replicate(const IColumn::Offsets & offsets) const
 {
     size_t size = data.size();
     if (size != offsets.size())
         throw Exception("Size of offsets doesn't match size of column.", ErrorCodes::SIZES_OF_COLUMNS_DOESNT_MATCH);
 
     if (0 == size)
-        return std::make_shared<Self>();
+        return this->create();
 
-    std::shared_ptr<Self> res = std::make_shared<Self>();
-    typename Self::Container_t & res_data = res->getData();
+    auto res = this->create();
+    typename Self::Container & res_data = res->getData();
     res_data.reserve(offsets.back());
 
-    IColumn::Offset_t prev_offset = 0;
+    IColumn::Offset prev_offset = 0;
     for (size_t i = 0; i < size; ++i)
     {
         size_t size_to_replicate = offsets[i] - prev_offset;
@@ -256,14 +264,20 @@ ColumnPtr ColumnVector<T>::replicate(const IColumn::Offsets_t & offsets) const
 }
 
 template <typename T>
+void ColumnVector<T>::gather(ColumnGathererStream & gatherer)
+{
+    gatherer.gather(*this);
+}
+
+template <typename T>
 void ColumnVector<T>::getExtremes(Field & min, Field & max) const
 {
     size_t size = data.size();
 
     if (size == 0)
     {
-        min = typename NearestFieldType<T>::Type(0);
-        max = typename NearestFieldType<T>::Type(0);
+        min = T(0);
+        max = T(0);
         return;
     }
 
@@ -293,26 +307,25 @@ void ColumnVector<T>::getExtremes(Field & min, Field & max) const
 
         if (x < cur_min)
             cur_min = x;
-
-        if (x > cur_max)
+        else if (x > cur_max)
             cur_max = x;
     }
 
-    min = typename NearestFieldType<T>::Type(cur_min);
-    max = typename NearestFieldType<T>::Type(cur_max);
+    min = NearestFieldType<T>(cur_min);
+    max = NearestFieldType<T>(cur_max);
 }
-
 
 /// Explicit template instantiations - to avoid code bloat in headers.
 template class ColumnVector<UInt8>;
 template class ColumnVector<UInt16>;
 template class ColumnVector<UInt32>;
 template class ColumnVector<UInt64>;
+template class ColumnVector<UInt128>;
 template class ColumnVector<Int8>;
 template class ColumnVector<Int16>;
 template class ColumnVector<Int32>;
 template class ColumnVector<Int64>;
+template class ColumnVector<Int128>;
 template class ColumnVector<Float32>;
 template class ColumnVector<Float64>;
-
 }

@@ -15,16 +15,21 @@ class LazyBlockInputStream : public IProfilingBlockInputStream
 public:
     using Generator = std::function<BlockInputStreamPtr()>;
 
-    LazyBlockInputStream(Generator generator_)
-        : generator(generator_) {}
-
-    String getName() const override { return "Lazy"; }
-
-    String getID() const override
+    LazyBlockInputStream(const Block & header_, Generator generator_)
+        : header(header_), generator(std::move(generator_))
     {
-        std::stringstream res;
-        res << "Lazy(" << this << ")";
-        return res.str();
+    }
+
+    LazyBlockInputStream(const char * name_, const Block & header_, Generator generator_)
+        : name(name_), header(header_), generator(std::move(generator_))
+    {
+    }
+
+    String getName() const override { return name; }
+
+    Block getHeader() const override
+    {
+        return header;
     }
 
 protected:
@@ -37,9 +42,9 @@ protected:
             if (!input)
                 return Block();
 
-            children.push_back(input);
+            auto * p_input = dynamic_cast<IProfilingBlockInputStream *>(input.get());
 
-            if (IProfilingBlockInputStream * p_input = dynamic_cast<IProfilingBlockInputStream *>(input.get()))
+            if (p_input)
             {
                 /// They could have been set before, but were not passed into the `input`.
                 if (progress_callback)
@@ -47,13 +52,25 @@ protected:
                 if (process_list_elem)
                     p_input->setProcessListElement(process_list_elem);
             }
+
+            input->readPrefix();
+
+            {
+                addChild(input);
+
+                if (isCancelled() && p_input)
+                    p_input->cancel(is_killed);
+            }
         }
 
         return input->read();
     }
 
 private:
+    const char * name = "Lazy";
+    Block header;
     Generator generator;
+
     BlockInputStreamPtr input;
 };
 

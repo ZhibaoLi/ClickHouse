@@ -1,8 +1,8 @@
 #pragma once
 
 #include <DataStreams/IProfilingBlockInputStream.h>
-#include <Interpreters/Limits.h>
 #include <Interpreters/SetVariants.h>
+
 
 namespace DB
 {
@@ -21,40 +21,38 @@ class DistinctSortedBlockInputStream : public IProfilingBlockInputStream
 {
 public:
     /// Empty columns_ means all collumns.
-    DistinctSortedBlockInputStream(BlockInputStreamPtr input_, const Limits & limits, size_t limit_hint_, Names columns_);
+    DistinctSortedBlockInputStream(const BlockInputStreamPtr & input, const SizeLimits & set_size_limits, size_t limit_hint_, const Names & columns);
 
     String getName() const override { return "DistinctSorted"; }
 
-    String getID() const override;
+    Block getHeader() const override { return children.at(0)->getHeader(); }
 
 protected:
     Block readImpl() override;
 
 private:
-    bool checkLimits() const;
-
-    ConstColumnPlainPtrs getKeyColumns(const Block & block) const;
+    ColumnRawPtrs getKeyColumns(const Block & block) const;
     /// When clearing_columns changed, we can clean HashSet to memory optimization
     /// clearing_columns is a left-prefix of SortDescription exists in key_columns
-    ConstColumnPlainPtrs getClearingColumns(const Block & block, const ConstColumnPlainPtrs & key_columns) const;
-    static bool rowsEqual(const ConstColumnPlainPtrs & lhs, size_t n, const ConstColumnPlainPtrs & rhs, size_t m);
+    ColumnRawPtrs getClearingColumns(const Block & block, const ColumnRawPtrs & key_columns) const;
+    static bool rowsEqual(const ColumnRawPtrs & lhs, size_t n, const ColumnRawPtrs & rhs, size_t m);
 
     /// return true if has new data
     template <typename Method>
     bool buildFilter(
         Method & method,
-        const ConstColumnPlainPtrs & key_columns,
-        const ConstColumnPlainPtrs & clearing_hint_columns,
+        const ColumnRawPtrs & key_columns,
+        const ColumnRawPtrs & clearing_hint_columns,
         IColumn::Filter & filter,
         size_t rows,
         ClearableSetVariants & variants) const;
 
     const SortDescription & description;
-    
+
     struct PreviousBlock
     {
         Block block;
-        ConstColumnPlainPtrs clearing_hint_columns;
+        ColumnRawPtrs clearing_hint_columns;
     };
     PreviousBlock prev_block;
 
@@ -64,9 +62,7 @@ private:
     size_t limit_hint;
 
     /// Restrictions on the maximum size of the output data.
-    size_t max_rows;
-    size_t max_bytes;
-    OverflowMode overflow_mode;
+    SizeLimits set_size_limits;
 };
 
 }

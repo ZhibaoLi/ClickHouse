@@ -13,7 +13,7 @@
 //#include <Common/HashTable/HashTableMerge.h>
 
 #include <IO/ReadBufferFromFile.h>
-#include <IO/CompressedReadBuffer.h>
+#include <Compression/CompressedReadBuffer.h>
 
 #include <Common/Stopwatch.h>
 #include <common/ThreadPool.h>
@@ -124,7 +124,7 @@ struct MergeSequential
     template <typename Merger>
     static void NO_INLINE execute(Map ** source_maps, size_t num_maps, Map *& result_map,
                         Merger && merger,
-                        ThreadPool & pool)
+                        ThreadPool &)
     {
         for (size_t i = 1; i < num_maps; ++i)
         {
@@ -144,7 +144,7 @@ struct MergeSequentialTransposed    /// In practice not better than usual.
     template <typename Merger>
     static void NO_INLINE execute(Map ** source_maps, size_t num_maps, Map *& result_map,
                         Merger && merger,
-                        ThreadPool & pool)
+                        ThreadPool &)
     {
         std::vector<typename Map::iterator> iterators(num_maps);
         for (size_t i = 1; i < num_maps; ++i)
@@ -186,8 +186,8 @@ struct MergeParallelForTwoLevelTable
                 for (size_t i = 0; i < num_maps; ++i)
                     section[i] = &source_maps[i]->impls[bucket];
 
-                typename Map::Impl * result_map;
-                ImplMerge::execute(section.data(), num_maps, result_map, merger, pool);
+                typename Map::Impl * res;
+                ImplMerge::execute(section.data(), num_maps, res, merger, pool);
             });
 
         pool.wait();
@@ -260,7 +260,7 @@ using Mutex = std::mutex;
 
 struct Creator
 {
-    void operator()(Value & x) const {}
+    void operator()(Value &) const {}
 };
 
 #if !__clang__
@@ -301,7 +301,7 @@ int main(int argc, char ** argv)
         DB::ReadBufferFromFileDescriptor in1(STDIN_FILENO);
         DB::CompressedReadBuffer in2(in1);
 
-        in2.readStrict(reinterpret_cast<char*>(&data[0]), sizeof(data[0]) * n);
+        in2.readStrict(reinterpret_cast<char*>(data.data()), sizeof(data[0]) * n);
 
         watch.stop();
         std::cerr << std::fixed << std::setprecision(2)

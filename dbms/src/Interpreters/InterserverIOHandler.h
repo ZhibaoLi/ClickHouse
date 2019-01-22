@@ -6,9 +6,11 @@
 #include <IO/ReadHelpers.h>
 #include <IO/WriteBufferFromString.h>
 #include <IO/WriteHelpers.h>
+#include <Common/ActionBlocker.h>
 #include <Core/Types.h>
 #include <map>
 #include <atomic>
+#include <utility>
 #include <Poco/Net/HTMLForm.h>
 
 namespace Poco { namespace Net { class HTTPServerResponse; } }
@@ -45,13 +47,11 @@ public:
     /// Serializes the location.
     std::string toString() const
     {
-        std::string serialized_location;
-        WriteBufferFromString buf(serialized_location);
+        WriteBufferFromOwnString buf;
         writeBinary(name, buf);
         writeBinary(host, buf);
         writeBinary(port, buf);
-        buf.next();
-        return serialized_location;
+        return buf.str();
     }
 
 public:
@@ -69,11 +69,8 @@ public:
     virtual void processQuery(const Poco::Net::HTMLForm & params, ReadBuffer & body, WriteBuffer & out, Poco::Net::HTTPServerResponse & response) = 0;
     virtual ~InterserverIOEndpoint() {}
 
-    void cancel() { is_cancelled = true; }
-
-protected:
-    /// You need to stop the data transfer.
-    std::atomic<bool> is_cancelled {false};
+    /// You need to stop the data transfer if blocker is activated.
+    ActionBlocker blocker;
 };
 
 using InterserverIOEndpointPtr = std::shared_ptr<InterserverIOEndpoint>;
@@ -87,26 +84,28 @@ class InterserverIOHandler
 public:
     void addEndpoint(const String & name, InterserverIOEndpointPtr endpoint)
     {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (endpoint_map.count(name))
+        std::lock_guard lock(mutex);
+        bool inserted = endpoint_map.try_emplace(name, std::move(endpoint)).second;
+        if (!inserted)
             throw Exception("Duplicate interserver IO endpoint: " + name, ErrorCodes::DUPLICATE_INTERSERVER_IO_ENDPOINT);
-        endpoint_map[name] = endpoint;
     }
 
     void removeEndpoint(const String & name)
     {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (!endpoint_map.count(name))
+        std::lock_guard lock(mutex);
+        if (!endpoint_map.erase(name))
             throw Exception("No interserver IO endpoint named " + name, ErrorCodes::NO_SUCH_INTERSERVER_IO_ENDPOINT);
-        endpoint_map.erase(name);
     }
 
     InterserverIOEndpointPtr getEndpoint(const String & name)
+    try
     {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (!endpoint_map.count(name))
-            throw Exception("No interserver IO endpoint named " + name, ErrorCodes::NO_SUCH_INTERSERVER_IO_ENDPOINT);
-        return endpoint_map[name];
+        std::lock_guard lock(mutex);
+        return endpoint_map.at(name);
+    }
+    catch (...)
+    {
+        throw Exception("No interserver IO endpoint named " + name, ErrorCodes::NO_SUCH_INTERSERVER_IO_ENDPOINT);
     }
 
 private:
@@ -121,7 +120,7 @@ class InterserverIOEndpointHolder
 {
 public:
     InterserverIOEndpointHolder(const String & name_, InterserverIOEndpointPtr endpoint_, InterserverIOHandler & handler_)
-        : name(name_), endpoint(endpoint_), handler(handler_)
+        : name(name_), endpoint(std::move(endpoint_)), handler(handler_)
     {
         handler.addEndpoint(name, endpoint);
     }
@@ -132,20 +131,18 @@ public:
     }
 
     ~InterserverIOEndpointHolder()
+    try
     {
-        try
-        {
-            handler.removeEndpoint(name);
-            /// After destroying the object, `endpoint` can still live, since its ownership is acquired during the processing of the request,
-            /// see InterserverIOHTTPHandler.cpp
-        }
-        catch (...)
-        {
-            tryLogCurrentException("~InterserverIOEndpointHolder");
-        }
+        handler.removeEndpoint(name);
+        /// After destroying the object, `endpoint` can still live, since its ownership is acquired during the processing of the request,
+        /// see InterserverIOHTTPHandler.cpp
+    }
+    catch (...)
+    {
+        tryLogCurrentException("~InterserverIOEndpointHolder");
     }
 
-    void cancel() { endpoint->cancel(); }
+    ActionBlocker & getBlocker() { return endpoint->blocker; }
 
 private:
     String name;

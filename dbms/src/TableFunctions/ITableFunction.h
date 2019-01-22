@@ -3,7 +3,6 @@
 #include <string>
 #include <memory>
 
-
 namespace DB
 {
 
@@ -31,10 +30,13 @@ public:
     /// Get the main function name.
     virtual std::string getName() const = 0;
 
-    /// Create storage according to the query
-    virtual StoragePtr execute(const ASTPtr & ast_function, const Context & context) const = 0;
+    /// Create storage according to the query.
+    StoragePtr execute(const ASTPtr & ast_function, const Context & context) const;
 
-    virtual ~ITableFunction() {};
+    virtual ~ITableFunction() {}
+
+private:
+    virtual StoragePtr executeImpl(const ASTPtr & ast_function, const Context & context) const = 0;
 };
 
 using TableFunctionPtr = std::shared_ptr<ITableFunction>;

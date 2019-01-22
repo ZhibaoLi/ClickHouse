@@ -1,16 +1,25 @@
-#include <common/logger_useful.h>
-#include <Poco/Util/Application.h>
-#include <Interpreters/EmbeddedDictionaries.h>
 #include <Dictionaries/Embedded/RegionsHierarchies.h>
-#include <Dictionaries/Embedded/TechDataHierarchy.h>
 #include <Dictionaries/Embedded/RegionsNames.h>
+#include <Dictionaries/Embedded/TechDataHierarchy.h>
+#include <Dictionaries/Embedded/IGeoDictionariesLoader.h>
+#include <Interpreters/Context.h>
+#include <Interpreters/EmbeddedDictionaries.h>
+
 #include <Common/setThreadName.h>
 #include <Common/Exception.h>
 #include <Common/config.h>
+#include <common/logger_useful.h>
+
+#include <Poco/Util/Application.h>
 
 
 namespace DB
 {
+
+namespace ErrorCodes
+{
+    extern const int UNFINISHED;
+}
 
 void EmbeddedDictionaries::handleException(const bool throw_on_error) const
 {
@@ -24,15 +33,23 @@ void EmbeddedDictionaries::handleException(const bool throw_on_error) const
 
 
 template <typename Dictionary>
-bool EmbeddedDictionaries::reloadDictionary(MultiVersion<Dictionary> & dictionary, const bool throw_on_error)
+bool EmbeddedDictionaries::reloadDictionary(
+    MultiVersion<Dictionary> & dictionary,
+    DictionaryReloader<Dictionary> reload_dictionary,
+    const bool throw_on_error,
+    const bool force_reload)
 {
-    if (Dictionary::isConfigured() && (!is_fast_start_stage || !dictionary.get()))
+    const auto & config = context.getConfigRef();
+
+    bool not_initialized = dictionary.get() == nullptr;
+
+    if (force_reload || !is_fast_start_stage || not_initialized)
     {
         try
         {
-            auto new_dictionary = std::make_unique<Dictionary>();
-            new_dictionary->reload();
-            dictionary.set(new_dictionary.release());
+            auto new_dictionary = reload_dictionary(config);
+            if (new_dictionary)
+                dictionary.set(std::move(new_dictionary));
         }
         catch (...)
         {
@@ -45,8 +62,10 @@ bool EmbeddedDictionaries::reloadDictionary(MultiVersion<Dictionary> & dictionar
 }
 
 
-bool EmbeddedDictionaries::reloadImpl(const bool throw_on_error)
+bool EmbeddedDictionaries::reloadImpl(const bool throw_on_error, const bool force_reload)
 {
+    std::unique_lock lock(mutex);
+
     /** If you can not update the directories, then despite this, do not throw an exception (use the old directories).
       * If there are no old correct directories, then when using functions that depend on them,
       *  will throw an exception.
@@ -58,14 +77,35 @@ bool EmbeddedDictionaries::reloadImpl(const bool throw_on_error)
     bool was_exception = false;
 
 #if USE_MYSQL
-    if (!reloadDictionary<TechDataHierarchy>(tech_data_hierarchy, throw_on_error))
+    DictionaryReloader<TechDataHierarchy> reload_tech_data = [=] (const Poco::Util::AbstractConfiguration & config)
+        -> std::unique_ptr<TechDataHierarchy>
+    {
+        if (!TechDataHierarchy::isConfigured(config))
+            return {};
+
+        auto dictionary = std::make_unique<TechDataHierarchy>();
+        dictionary->reload();
+        return dictionary;
+    };
+
+    if (!reloadDictionary<TechDataHierarchy>(tech_data_hierarchy, reload_tech_data, throw_on_error, force_reload))
         was_exception = true;
 #endif
 
-    if (!reloadDictionary<RegionsHierarchies>(regions_hierarchies, throw_on_error))
+    DictionaryReloader<RegionsHierarchies> reload_regions_hierarchies = [=] (const Poco::Util::AbstractConfiguration & config)
+    {
+        return geo_dictionaries_loader->reloadRegionsHierarchies(config);
+    };
+
+    if (!reloadDictionary<RegionsHierarchies>(regions_hierarchies, std::move(reload_regions_hierarchies), throw_on_error, force_reload))
         was_exception = true;
 
-    if (!reloadDictionary<RegionsNames>(regions_names, throw_on_error))
+    DictionaryReloader<RegionsNames> reload_regions_names = [=] (const Poco::Util::AbstractConfiguration & config)
+    {
+        return geo_dictionaries_loader->reloadRegionsNames(config);
+    };
+
+    if (!reloadDictionary<RegionsNames>(regions_names, std::move(reload_regions_names), throw_on_error, force_reload))
         was_exception = true;
 
     if (!was_exception)
@@ -100,24 +140,30 @@ void EmbeddedDictionaries::reloadPeriodically()
 }
 
 
-EmbeddedDictionaries::EmbeddedDictionaries(const bool throw_on_error, const int reload_period_)
-    : reload_period(reload_period_), log(&Logger::get("EmbeddedDictionaries"))
+EmbeddedDictionaries::EmbeddedDictionaries(
+    std::unique_ptr<IGeoDictionariesLoader> geo_dictionaries_loader_,
+    Context & context_,
+    const bool throw_on_error)
+    : log(&Logger::get("EmbeddedDictionaries"))
+    , context(context_)
+    , geo_dictionaries_loader(std::move(geo_dictionaries_loader_))
+    , reload_period(context_.getConfigRef().getInt("builtin_dictionaries_reload_interval", 3600))
 {
     reloadImpl(throw_on_error);
     reloading_thread = std::thread([this] { reloadPeriodically(); });
 }
 
 
-EmbeddedDictionaries::EmbeddedDictionaries(const bool throw_on_error)
-    : EmbeddedDictionaries(throw_on_error,
-        Poco::Util::Application::instance().config().getInt("builtin_dictionaries_reload_interval", 3600))
-{}
-
-
 EmbeddedDictionaries::~EmbeddedDictionaries()
 {
     destroy.set();
     reloading_thread.join();
+}
+
+void EmbeddedDictionaries::reload()
+{
+    if (!reloadImpl(true, true))
+        throw Exception("Some embedded dictionaries were not successfully reloaded", ErrorCodes::UNFINISHED);
 }
 
 

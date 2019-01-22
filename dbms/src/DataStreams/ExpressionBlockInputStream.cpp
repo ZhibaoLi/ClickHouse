@@ -5,22 +5,15 @@
 namespace DB
 {
 
-ExpressionBlockInputStream::ExpressionBlockInputStream(BlockInputStreamPtr input_, ExpressionActionsPtr expression_)
+ExpressionBlockInputStream::ExpressionBlockInputStream(const BlockInputStreamPtr & input, const ExpressionActionsPtr & expression_)
     : expression(expression_)
 {
-    children.push_back(input_);
+    children.push_back(input);
 }
 
 String ExpressionBlockInputStream::getName() const { return "Expression"; }
 
-String ExpressionBlockInputStream::getID() const
-{
-    std::stringstream res;
-    res << "Expression(" << children.back()->getID() << ", " << expression->getID() << ")";
-    return res.str();
-}
-
-const Block & ExpressionBlockInputStream::getTotals()
+Block ExpressionBlockInputStream::getTotals()
 {
     if (IProfilingBlockInputStream * child = dynamic_cast<IProfilingBlockInputStream *>(&*children.back()))
     {
@@ -31,14 +24,19 @@ const Block & ExpressionBlockInputStream::getTotals()
     return totals;
 }
 
+Block ExpressionBlockInputStream::getHeader() const
+{
+    Block res = children.back()->getHeader();
+    expression->execute(res, true);
+    return res;
+}
+
 Block ExpressionBlockInputStream::readImpl()
 {
     Block res = children.back()->read();
     if (!res)
         return res;
-
     expression->execute(res);
-
     return res;
 }
 

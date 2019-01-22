@@ -1,9 +1,8 @@
+#include <Common/config.h>
 #include <Functions/registerFunctions.h>
-
 #include <Functions/FunctionFactory.h>
 
 
-#include <iostream>
 
 namespace DB
 {
@@ -13,6 +12,7 @@ namespace DB
   */
 void registerFunctionsArithmetic(FunctionFactory &);
 void registerFunctionsArray(FunctionFactory &);
+void registerFunctionsTuple(FunctionFactory &);
 void registerFunctionsCoding(FunctionFactory &);
 void registerFunctionsComparison(FunctionFactory &);
 void registerFunctionsConditional(FunctionFactory &);
@@ -20,8 +20,10 @@ void registerFunctionsConversion(FunctionFactory &);
 void registerFunctionsDateTime(FunctionFactory &);
 void registerFunctionsEmbeddedDictionaries(FunctionFactory &);
 void registerFunctionsExternalDictionaries(FunctionFactory &);
+void registerFunctionsExternalModels(FunctionFactory &);
 void registerFunctionsFormatting(FunctionFactory &);
 void registerFunctionsHashing(FunctionFactory &);
+void registerFunctionsConsistentHashing(FunctionFactory &);
 void registerFunctionsHigherOrder(FunctionFactory &);
 void registerFunctionsLogical(FunctionFactory &);
 void registerFunctionsMiscellaneous(FunctionFactory &);
@@ -34,12 +36,14 @@ void registerFunctionsStringSearch(FunctionFactory &);
 void registerFunctionsURL(FunctionFactory &);
 void registerFunctionsVisitParam(FunctionFactory &);
 void registerFunctionsMath(FunctionFactory &);
-void registerFunctionsTransform(FunctionFactory &);
 void registerFunctionsGeo(FunctionFactory &);
-void registerFunctionsCharset(FunctionFactory &);
 void registerFunctionsNull(FunctionFactory &);
 void registerFunctionsFindCluster(FunctionFactory &);
+void registerFunctionTransform(FunctionFactory &);
 
+#if USE_ICU
+void registerFunctionConvertCharset(FunctionFactory &);
+#endif
 
 void registerFunctions()
 {
@@ -47,6 +51,7 @@ void registerFunctions()
 
     registerFunctionsArithmetic(factory);
     registerFunctionsArray(factory);
+    registerFunctionsTuple(factory);
     registerFunctionsCoding(factory);
     registerFunctionsComparison(factory);
     registerFunctionsConditional(factory);
@@ -54,8 +59,10 @@ void registerFunctions()
     registerFunctionsDateTime(factory);
     registerFunctionsEmbeddedDictionaries(factory);
     registerFunctionsExternalDictionaries(factory);
+    registerFunctionsExternalModels(factory);
     registerFunctionsFormatting(factory);
     registerFunctionsHashing(factory);
+    registerFunctionsConsistentHashing(factory);
     registerFunctionsHigherOrder(factory);
     registerFunctionsLogical(factory);
     registerFunctionsMiscellaneous(factory);
@@ -68,11 +75,14 @@ void registerFunctions()
     registerFunctionsURL(factory);
     registerFunctionsVisitParam(factory);
     registerFunctionsMath(factory);
-    registerFunctionsTransform(factory);
     registerFunctionsGeo(factory);
-    registerFunctionsCharset(factory);
     registerFunctionsNull(factory);
     registerFunctionsFindCluster(factory);
+    registerFunctionTransform(factory);
+
+#if USE_ICU
+    registerFunctionConvertCharset(factory);
+#endif
 }
 
 }

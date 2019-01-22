@@ -2,7 +2,7 @@
 
 #include <Interpreters/Aggregator.h>
 #include <IO/ReadBufferFromFile.h>
-#include <IO/CompressedReadBuffer.h>
+#include <Compression/CompressedReadBuffer.h>
 #include <DataStreams/IProfilingBlockInputStream.h>
 
 
@@ -22,20 +22,15 @@ public:
       * Aggregate functions are searched everywhere in the expression.
       * Columns corresponding to keys and arguments of aggregate functions must already be computed.
       */
-    AggregatingBlockInputStream(BlockInputStreamPtr input_, const Aggregator::Params & params_, bool final_)
+    AggregatingBlockInputStream(const BlockInputStreamPtr & input, const Aggregator::Params & params_, bool final_)
         : params(params_), aggregator(params), final(final_)
     {
-        children.push_back(input_);
+        children.push_back(input);
     }
 
     String getName() const override { return "Aggregating"; }
 
-    String getID() const override
-    {
-        std::stringstream res;
-        res << "Aggregating(" << children.back()->getID() << ", " << aggregator.getID() << ")";
-        return res.str();
-    }
+    Block getHeader() const override;
 
 protected:
     Block readImpl() override;

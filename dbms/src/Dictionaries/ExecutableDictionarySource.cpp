@@ -1,45 +1,95 @@
-#include <thread>
+#include "ExecutableDictionarySource.h"
+
 #include <future>
-
-#include <Dictionaries/ExecutableDictionarySource.h>
-
-#include <Common/ShellCommand.h>
-#include <Interpreters/Context.h>
-#include <DataStreams/OwningBlockInputStream.h>
-#include <Dictionaries/DictionarySourceHelpers.h>
-
+#include <thread>
 #include <DataStreams/IBlockOutputStream.h>
-#include <DataTypes/DataTypesNumber.h>
-
+#include <DataStreams/OwningBlockInputStream.h>
+#include <Interpreters/Context.h>
+#include <Common/ShellCommand.h>
 #include <common/logger_useful.h>
+#include "DictionarySourceFactory.h"
+#include "DictionarySourceHelpers.h"
+#include "DictionaryStructure.h"
 
 
 namespace DB
 {
-
 static const size_t max_block_size = 8192;
 
 
-ExecutableDictionarySource::ExecutableDictionarySource(const DictionaryStructure & dict_struct_,
-    const Poco::Util::AbstractConfiguration & config, const std::string & config_prefix,
-    Block & sample_block, const Context & context)
-    : log(&Logger::get("ExecutableDictionarySource")),
-    dict_struct{dict_struct_},
-    command{config.getString(config_prefix + ".command")},
-    format{config.getString(config_prefix + ".format")},
-    sample_block{sample_block},
-    context(context)
+namespace
+{
+    /// Owns ShellCommand and calls wait for it.
+    class ShellCommandOwningBlockInputStream : public OwningBlockInputStream<ShellCommand>
+    {
+    public:
+        ShellCommandOwningBlockInputStream(const BlockInputStreamPtr & impl, std::unique_ptr<ShellCommand> own_)
+            : OwningBlockInputStream(std::move(impl), std::move(own_))
+        {
+        }
+
+        void readSuffix() override
+        {
+            OwningBlockInputStream<ShellCommand>::readSuffix();
+            own->wait();
+        }
+    };
+
+}
+
+
+ExecutableDictionarySource::ExecutableDictionarySource(
+    const DictionaryStructure & dict_struct_,
+    const Poco::Util::AbstractConfiguration & config,
+    const std::string & config_prefix,
+    Block & sample_block,
+    const Context & context)
+    : log(&Logger::get("ExecutableDictionarySource"))
+    , update_time{std::chrono::system_clock::from_time_t(0)}
+    , dict_struct{dict_struct_}
+    , command{config.getString(config_prefix + ".command")}
+    , update_field{config.getString(config_prefix + ".update_field", "")}
+    , format{config.getString(config_prefix + ".format")}
+    , sample_block{sample_block}
+    , context(context)
 {
 }
 
 ExecutableDictionarySource::ExecutableDictionarySource(const ExecutableDictionarySource & other)
-    : log(&Logger::get("ExecutableDictionarySource")),
-    dict_struct{other.dict_struct},
-    command{other.command},
-    format{other.format},
-    sample_block{other.sample_block},
-    context(other.context)
+    : log(&Logger::get("ExecutableDictionarySource"))
+    , update_time{other.update_time}
+    , dict_struct{other.dict_struct}
+    , command{other.command}
+    , update_field{other.update_field}
+    , format{other.format}
+    , sample_block{other.sample_block}
+    , context(other.context)
 {
+}
+
+std::string ExecutableDictionarySource::getUpdateFieldAndDate()
+{
+    if (update_time != std::chrono::system_clock::from_time_t(0))
+    {
+        auto tmp_time = update_time;
+        update_time = std::chrono::system_clock::now();
+        time_t hr_time = std::chrono::system_clock::to_time_t(tmp_time) - 1;
+        char buffer[80];
+        struct tm * timeinfo;
+        timeinfo = localtime(&hr_time);
+        strftime(buffer, 80, "\"%Y-%m-%d %H:%M:%S\"", timeinfo);
+        std::string str_time(buffer);
+        return command + " " + update_field + " " + str_time;
+        ///Example case: command -T "2018-02-12 12:44:04"
+        ///should return all entries after mentioned date
+        ///if executable is eligible to return entries according to date.
+        ///Where "-T" is passed as update_field.
+    }
+    else
+    {
+        std::string str_time("\"0000-00-00 00:00:00\""); ///for initial load
+        return command + " " + update_field + " " + str_time;
+    }
 }
 
 BlockInputStreamPtr ExecutableDictionarySource::loadAll()
@@ -47,58 +97,79 @@ BlockInputStreamPtr ExecutableDictionarySource::loadAll()
     LOG_TRACE(log, "loadAll " + toString());
     auto process = ShellCommand::execute(command);
     auto input_stream = context.getInputFormat(format, process->out, sample_block, max_block_size);
-    return std::make_shared<OwningBlockInputStream<ShellCommand>>(input_stream, std::move(process));
+    return std::make_shared<ShellCommandOwningBlockInputStream>(input_stream, std::move(process));
 }
 
+BlockInputStreamPtr ExecutableDictionarySource::loadUpdatedAll()
+{
+    std::string command_update = getUpdateFieldAndDate();
+    LOG_TRACE(log, "loadUpdatedAll " + command_update);
+    auto process = ShellCommand::execute(command_update);
+    auto input_stream = context.getInputFormat(format, process->out, sample_block, max_block_size);
+    return std::make_shared<ShellCommandOwningBlockInputStream>(input_stream, std::move(process));
+}
 
-/** A stream, that also runs and waits for background thread
+namespace
+{
+    /** A stream, that also runs and waits for background thread
   * (that will feed data into pipe to be read from the other side of the pipe).
   */
-class BlockInputStreamWithBackgroundThread : public IProfilingBlockInputStream
-{
-public:
-    BlockInputStreamWithBackgroundThread(
-        const BlockInputStreamPtr & stream_, std::unique_ptr<ShellCommand> && command_,
-        std::packaged_task<void()> && task_)
-        : stream{stream_}, command{std::move(command_)}, task(std::move(task_)),
-        thread([this]{ task(); command->in.close(); })
+    class BlockInputStreamWithBackgroundThread final : public IProfilingBlockInputStream
     {
-        children.push_back(stream);
-    }
-
-    ~BlockInputStreamWithBackgroundThread() override
-    {
-        if (thread.joinable())
+    public:
+        BlockInputStreamWithBackgroundThread(
+            const BlockInputStreamPtr & stream_, std::unique_ptr<ShellCommand> && command_, std::packaged_task<void()> && task_)
+            : stream{stream_}, command{std::move(command_)}, task(std::move(task_)), thread([this] {
+                task();
+                command->in.close();
+            })
         {
-            try
+            children.push_back(stream);
+        }
+
+        ~BlockInputStreamWithBackgroundThread() override
+        {
+            if (thread.joinable())
             {
-                readSuffix();
-            }
-            catch (...)
-            {
-                tryLogCurrentException(__PRETTY_FUNCTION__);
+                try
+                {
+                    readSuffix();
+                }
+                catch (...)
+                {
+                    tryLogCurrentException(__PRETTY_FUNCTION__);
+                }
             }
         }
-    }
 
-private:
-    Block readImpl() override { return stream->read(); }
+        Block getHeader() const override { return stream->getHeader(); }
 
-    void readSuffix() override
-    {
-        thread.join();
-        /// To rethrow an exception, if any.
-        task.get_future().get();
-    }
+    private:
+        Block readImpl() override { return stream->read(); }
 
-    String getName() const override { return "WithBackgroundThread"; }
-    String getID() const override {  return "WithBackgroundThread(" + stream->getID() + ")"; }
+        void readSuffix() override
+        {
+            IProfilingBlockInputStream::readSuffix();
+            if (!wait_called)
+            {
+                wait_called = true;
+                command->wait();
+            }
+            thread.join();
+            /// To rethrow an exception, if any.
+            task.get_future().get();
+        }
 
-    BlockInputStreamPtr stream;
-    std::unique_ptr<ShellCommand> command;
-    std::packaged_task<void()> task;
-    std::thread thread;
-};
+        String getName() const override { return "WithBackgroundThread"; }
+
+        BlockInputStreamPtr stream;
+        std::unique_ptr<ShellCommand> command;
+        std::packaged_task<void()> task;
+        std::thread thread;
+        bool wait_called = false;
+    };
+
+}
 
 
 BlockInputStreamPtr ExecutableDictionarySource::loadIds(const std::vector<UInt64> & ids)
@@ -110,15 +181,10 @@ BlockInputStreamPtr ExecutableDictionarySource::loadIds(const std::vector<UInt64
     auto input_stream = context.getInputFormat(format, process->out, sample_block, max_block_size);
 
     return std::make_shared<BlockInputStreamWithBackgroundThread>(
-        input_stream, std::move(process), std::packaged_task<void()>(
-        [output_stream, &ids, this]() mutable
-        {
-            formatIDs(output_stream, ids);
-        }));
+        input_stream, std::move(process), std::packaged_task<void()>([output_stream, &ids]() mutable { formatIDs(output_stream, ids); }));
 }
 
-BlockInputStreamPtr ExecutableDictionarySource::loadKeys(
-    const Columns & key_columns, const std::vector<std::size_t> & requested_rows)
+BlockInputStreamPtr ExecutableDictionarySource::loadKeys(const Columns & key_columns, const std::vector<size_t> & requested_rows)
 {
     LOG_TRACE(log, "loadKeys " << toString() << " size = " << requested_rows.size());
     auto process = ShellCommand::execute(command);
@@ -127,8 +193,7 @@ BlockInputStreamPtr ExecutableDictionarySource::loadKeys(
     auto input_stream = context.getInputFormat(format, process->out, sample_block, max_block_size);
 
     return std::make_shared<BlockInputStreamWithBackgroundThread>(
-        input_stream, std::move(process), std::packaged_task<void()>(
-        [output_stream, key_columns, &requested_rows, this]() mutable
+        input_stream, std::move(process), std::packaged_task<void()>([output_stream, key_columns, &requested_rows, this]() mutable
         {
             formatKeys(dict_struct, output_stream, key_columns, requested_rows);
         }));
@@ -144,6 +209,14 @@ bool ExecutableDictionarySource::supportsSelectiveLoad() const
     return true;
 }
 
+bool ExecutableDictionarySource::hasUpdateField() const
+{
+    if (update_field.empty())
+        return false;
+    else
+        return true;
+}
+
 DictionarySourcePtr ExecutableDictionarySource::clone() const
 {
     return std::make_unique<ExecutableDictionarySource>(*this);
@@ -152,6 +225,21 @@ DictionarySourcePtr ExecutableDictionarySource::clone() const
 std::string ExecutableDictionarySource::toString() const
 {
     return "Executable: " + command;
+}
+
+void registerDictionarySourceExecutable(DictionarySourceFactory & factory)
+{
+    auto createTableSource = [=](const DictionaryStructure & dict_struct,
+                                 const Poco::Util::AbstractConfiguration & config,
+                                 const std::string & config_prefix,
+                                 Block & sample_block,
+                                 const Context & context) -> DictionarySourcePtr {
+        if (dict_struct.has_expressions)
+            throw Exception{"Dictionary source of type `executable` does not support attribute expressions", ErrorCodes::LOGICAL_ERROR};
+
+        return std::make_unique<ExecutableDictionarySource>(dict_struct, config, config_prefix + ".executable", sample_block, context);
+    };
+    factory.registerSource("executable", createTableSource);
 }
 
 }

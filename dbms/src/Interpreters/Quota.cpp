@@ -3,11 +3,12 @@
 #include <common/logger_useful.h>
 
 #include <Common/SipHash.h>
-#include <Common/StringUtils.h>
+#include <Common/StringUtils/StringUtils.h>
 #include <IO/ReadHelpers.h>
 #include <Interpreters/Quota.h>
 
 #include <set>
+#include <random>
 
 
 namespace DB
@@ -22,7 +23,7 @@ namespace ErrorCodes
 
 
 template <typename Counter>
-void QuotaValues<Counter>::initFromConfig(const String & config_elem, Poco::Util::AbstractConfiguration & config)
+void QuotaValues<Counter>::initFromConfig(const String & config_elem, const Poco::Util::AbstractConfiguration & config)
 {
     queries             = config.getUInt64(config_elem + ".queries",        0);
     errors              = config.getUInt64(config_elem + ".errors",         0);
@@ -33,14 +34,16 @@ void QuotaValues<Counter>::initFromConfig(const String & config_elem, Poco::Util
     execution_time_usec = config.getUInt64(config_elem + ".execution_time", 0) * 1000000ULL;
 }
 
-template void QuotaValues<size_t>::initFromConfig(const String & config_elem, Poco::Util::AbstractConfiguration & config);
-template void QuotaValues<std::atomic<size_t>>::initFromConfig(const String & config_elem, Poco::Util::AbstractConfiguration & config);
+template void QuotaValues<size_t>::initFromConfig(const String & config_elem, const Poco::Util::AbstractConfiguration & config);
+template void QuotaValues<std::atomic<size_t>>::initFromConfig(const String & config_elem, const Poco::Util::AbstractConfiguration & config);
 
 
-void QuotaForInterval::initFromConfig(const String & config_elem, time_t duration_, time_t offset_, Poco::Util::AbstractConfiguration & config)
+void QuotaForInterval::initFromConfig(
+    const String & config_elem, time_t duration_, bool randomize_, time_t offset_, const Poco::Util::AbstractConfiguration & config)
 {
-    rounded_time = 0;
+    rounded_time.store(0, std::memory_order_relaxed);
     duration = duration_;
+    randomize = randomize_;
     offset = offset_;
     max.initFromConfig(config_elem, config);
 }
@@ -48,21 +51,23 @@ void QuotaForInterval::initFromConfig(const String & config_elem, time_t duratio
 void QuotaForInterval::checkExceeded(time_t current_time, const String & quota_name, const String & user_name)
 {
     updateTime(current_time);
-    check(max.queries, used.queries, current_time, quota_name, user_name, "Queries");
-    check(max.errors, used.errors, current_time, quota_name, user_name, "Errors");
-    check(max.result_rows, used.result_rows, current_time, quota_name, user_name, "Total result rows");
-    check(max.result_bytes, used.result_bytes, current_time, quota_name, user_name, "Total result bytes");
-    check(max.read_rows, used.read_rows, current_time, quota_name, user_name, "Total rows read");
-    check(max.read_bytes, used.read_bytes, current_time, quota_name, user_name, "Total bytes read");
-    check(max.execution_time_usec / 1000000, used.execution_time_usec / 1000000, current_time, quota_name, user_name, "Total execution time");
+    check(max.queries, used.queries, quota_name, user_name, "Queries");
+    check(max.errors, used.errors, quota_name, user_name, "Errors");
+    check(max.result_rows, used.result_rows, quota_name, user_name, "Total result rows");
+    check(max.result_bytes, used.result_bytes, quota_name, user_name, "Total result bytes");
+    check(max.read_rows, used.read_rows, quota_name, user_name, "Total rows read");
+    check(max.read_bytes, used.read_bytes, quota_name, user_name, "Total bytes read");
+    check(max.execution_time_usec / 1000000, used.execution_time_usec / 1000000, quota_name, user_name, "Total execution time");
 }
 
 String QuotaForInterval::toString() const
 {
     std::stringstream res;
 
+    auto loaded_rounded_time = rounded_time.load(std::memory_order_relaxed);
+
     res << std::fixed << std::setprecision(3)
-        << "Interval:       " << LocalDateTime(rounded_time) << " - " << LocalDateTime(rounded_time + duration) << ".\n"
+        << "Interval:       " << LocalDateTime(loaded_rounded_time) << " - " << LocalDateTime(loaded_rounded_time + duration) << ".\n"
         << "Queries:        " << used.queries         << ".\n"
         << "Errors:         " << used.errors         << ".\n"
         << "Result rows:    " << used.result_rows     << ".\n"
@@ -107,15 +112,27 @@ void QuotaForInterval::checkAndAddExecutionTime(time_t current_time, const Strin
 
 void QuotaForInterval::updateTime(time_t current_time)
 {
-    if (current_time >= rounded_time + static_cast<int>(duration))
+    /** If current time is greater than end of interval,
+      *  then clear accumulated quota values and switch to next interval [rounded_time, rounded_time + duration).
+      */
+
+    auto loaded_rounded_time = rounded_time.load(std::memory_order_acquire);
+    while (true)
     {
-        rounded_time = (current_time - offset) / duration * duration + offset;
-        used.clear();
+        if (current_time < loaded_rounded_time + static_cast<time_t>(duration))
+            break;
+
+        time_t new_rounded_time = (current_time - offset) / duration * duration + offset;
+        if (rounded_time.compare_exchange_strong(loaded_rounded_time, new_rounded_time))
+        {
+            used.clear();
+            break;
+        }
     }
 }
 
 void QuotaForInterval::check(
-    size_t max_amount, size_t used_amount, time_t current_time,
+    size_t max_amount, size_t used_amount,
     const String & quota_name, const String & user_name, const char * resource_name)
 {
     if (max_amount && used_amount > max_amount)
@@ -136,7 +153,7 @@ void QuotaForInterval::check(
 
         message << " has been exceeded. "
             << resource_name << ": " << used_amount << ", max: " << max_amount << ". "
-            << "Interval will end at " << LocalDateTime(rounded_time + duration) << ". "
+            << "Interval will end at " << LocalDateTime(rounded_time.load(std::memory_order_relaxed) + duration) << ". "
             << "Name of quota template: '" << quota_name << "'.";
 
         throw Exception(message.str(), ErrorCodes::QUOTA_EXPIRED);
@@ -144,7 +161,7 @@ void QuotaForInterval::check(
 }
 
 
-void QuotaForIntervals::initFromConfig(const String & config_elem, Poco::Util::AbstractConfiguration & config, std::mt19937 & rng)
+void QuotaForIntervals::initFromConfig(const String & config_elem, const Poco::Util::AbstractConfiguration & config, pcg64 & rng)
 {
     Poco::Util::AbstractConfiguration::Keys config_keys;
     config.keys(config_elem, config_keys);
@@ -158,14 +175,14 @@ void QuotaForIntervals::initFromConfig(const String & config_elem, Poco::Util::A
         time_t duration = config.getInt(interval_config_elem + ".duration", 0);
         time_t offset = 0;
 
-        if (!duration) /// Skip quaotas with zero duration
+        if (!duration) /// Skip quotas with zero duration
             continue;
 
         bool randomize = config.getBool(interval_config_elem + ".randomize", false);
         if (randomize)
             offset = std::uniform_int_distribution<decltype(duration)>(0, duration - 1)(rng);
 
-        cont[duration].initFromConfig(interval_config_elem, duration, offset, config);
+        cont[duration].initFromConfig(interval_config_elem, duration, randomize, offset, config);
     }
 }
 
@@ -182,7 +199,7 @@ void QuotaForIntervals::setMax(const QuotaForIntervals & quota)
     for (auto & x : quota.cont)
     {
         if (!cont.count(x.first))
-            cont[x.first] = x.second;
+            cont.emplace(x.first, x.second);
         else
             cont[x.first].max = x.second.max;
     }
@@ -235,7 +252,7 @@ String QuotaForIntervals::toString() const
 }
 
 
-void Quota::loadFromConfig(const String & config_elem, const String & name_, Poco::Util::AbstractConfiguration & config, std::mt19937 & rng)
+void Quota::loadFromConfig(const String & config_elem, const String & name_, const Poco::Util::AbstractConfiguration & config, pcg64 & rng)
 {
     name = name_;
 
@@ -254,7 +271,7 @@ void Quota::loadFromConfig(const String & config_elem, const String & name_, Poc
 
     QuotaForIntervals new_max(name, {});
     new_max.initFromConfig(config_elem, config, rng);
-    if (!(new_max == max))
+    if (!new_max.hasEqualConfiguration(max))
     {
         max = new_max;
         for (auto & quota : quota_for_keys)
@@ -281,7 +298,7 @@ QuotaForIntervalsPtr Quota::get(const String & quota_key, const String & user_na
                 ? quota_key
                 : user_name));
 
-    std::lock_guard<std::mutex> lock(mutex);
+    std::lock_guard lock(mutex);
 
     Container::iterator it = quota_for_keys.find(quota_key_hashed);
     if (quota_for_keys.end() == it)
@@ -291,9 +308,9 @@ QuotaForIntervalsPtr Quota::get(const String & quota_key, const String & user_na
 }
 
 
-void Quotas::loadFromConfig(Poco::Util::AbstractConfiguration & config)
+void Quotas::loadFromConfig(const Poco::Util::AbstractConfiguration & config)
 {
-    std::mt19937 rng;
+    pcg64 rng;
 
     Poco::Util::AbstractConfiguration::Keys config_keys;
     config.keys("quotas", config_keys);
@@ -310,9 +327,9 @@ void Quotas::loadFromConfig(Poco::Util::AbstractConfiguration & config)
 
     for (Poco::Util::AbstractConfiguration::Keys::const_iterator it = config_keys.begin(); it != config_keys.end(); ++it)
     {
-        if (!cont[*it])
-            cont[*it] = std::make_unique<Quota>();
-        cont[*it]->loadFromConfig("quotas." + *it, *it, config, rng);
+        if (!cont.count(*it))
+            cont.try_emplace(*it);
+        cont[*it].loadFromConfig("quotas." + *it, *it, config, rng);
     }
 }
 
@@ -322,7 +339,7 @@ QuotaForIntervalsPtr Quotas::get(const String & name, const String & quota_key, 
     if (cont.end() == it)
         throw Exception("Unknown quota " + name, ErrorCodes::UNKNOWN_QUOTA);
 
-    return it->second->get(quota_key, user_name, ip);
+    return it->second.get(quota_key, user_name, ip);
 }
 
 }

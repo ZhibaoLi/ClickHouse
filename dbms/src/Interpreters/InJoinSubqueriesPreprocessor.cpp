@@ -1,10 +1,12 @@
 #include <Interpreters/InJoinSubqueriesPreprocessor.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/DatabaseAndTableWithAlias.h>
 #include <Storages/StorageDistributed.h>
+#include <Parsers/ASTIdentifier.h>
 #include <Parsers/ASTSelectQuery.h>
 #include <Parsers/ASTTablesInSelectQuery.h>
 #include <Parsers/ASTFunction.h>
-#include <Parsers/ASTIdentifier.h>
+#include <Common/typeid_cast.h>
 
 
 namespace DB
@@ -80,42 +82,8 @@ void forEachTable(IAST * node, F && f)
 
 StoragePtr tryGetTable(const ASTPtr & database_and_table, const Context & context)
 {
-    String database;
-    String table;
-
-    const ASTIdentifier * id = static_cast<const ASTIdentifier *>(database_and_table.get());
-
-    if (id->children.empty())
-        table = id->name;
-    else if (id->children.size() == 2)
-    {
-        database = static_cast<const ASTIdentifier *>(id->children[0].get())->name;
-        table = static_cast<const ASTIdentifier *>(id->children[1].get())->name;
-    }
-    else
-        throw Exception("Logical error: unexpected number of components in table expression", ErrorCodes::LOGICAL_ERROR);
-
-    return context.tryGetTable(database, table);
-}
-
-
-void replaceDatabaseAndTable(ASTPtr & database_and_table, const String & database_name, const String & table_name)
-{
-    ASTPtr table = std::make_shared<ASTIdentifier>(StringRange(), table_name, ASTIdentifier::Table);
-
-    if (!database_name.empty())
-    {
-        ASTPtr database = std::make_shared<ASTIdentifier>(StringRange(), database_name, ASTIdentifier::Database);
-
-        database_and_table = std::make_shared<ASTIdentifier>(
-            StringRange(), database_name + "." + table_name, ASTIdentifier::Table);
-        database_and_table->children = {database, table};
-    }
-    else
-    {
-        database_and_table = std::make_shared<ASTIdentifier>(
-            StringRange(), table_name, ASTIdentifier::Table);
-    }
+    DatabaseAndTableWithAlias db_and_table(database_and_table);
+    return context.tryGetTable(db_and_table.database, db_and_table.table);
 }
 
 }
@@ -145,17 +113,19 @@ void InJoinSubqueriesPreprocessor::process(ASTSelectQuery * query) const
     ASTTableExpression * table_expression = static_cast<ASTTableExpression *>(tables_element.table_expression.get());
 
     /// If not ordinary table, skip it.
-    if (!table_expression || !table_expression->database_and_table_name)
+    if (!table_expression->database_and_table_name)
         return;
 
     /// If not really distributed table, skip it.
-    StoragePtr storage = tryGetTable(table_expression->database_and_table_name, context);
-    if (!storage || !hasAtLeastTwoShards(*storage))
-        return;
+    {
+        StoragePtr storage = tryGetTable(table_expression->database_and_table_name, context);
+        if (!storage || !hasAtLeastTwoShards(*storage))
+            return;
+    }
 
     forEachNonGlobalSubquery(query, [&] (IAST * subquery, IAST * function, IAST * table_join)
     {
-         forEachTable(subquery, [&] (ASTPtr & database_and_table)
+        forEachTable(subquery, [&] (ASTPtr & database_and_table)
         {
             StoragePtr storage = tryGetTable(database_and_table, context);
 
@@ -198,7 +168,7 @@ void InJoinSubqueriesPreprocessor::process(ASTSelectQuery * query) const
                 std::string table;
                 std::tie(database, table) = getRemoteDatabaseAndTableName(*storage);
 
-                replaceDatabaseAndTable(database_and_table, database, table);
+                database_and_table = createTableIdentifier(database, table);
             }
             else
                 throw Exception("InJoinSubqueriesPreprocessor: unexpected value of 'distributed_product_mode' setting", ErrorCodes::LOGICAL_ERROR);
@@ -209,7 +179,7 @@ void InJoinSubqueriesPreprocessor::process(ASTSelectQuery * query) const
 
 bool InJoinSubqueriesPreprocessor::hasAtLeastTwoShards(const IStorage & table) const
 {
-    const StorageDistributed * distributed = typeid_cast<const StorageDistributed *>(&table);
+    const StorageDistributed * distributed = dynamic_cast<const StorageDistributed *>(&table);
     if (!distributed)
         return false;
 
@@ -220,7 +190,7 @@ bool InJoinSubqueriesPreprocessor::hasAtLeastTwoShards(const IStorage & table) c
 std::pair<std::string, std::string>
 InJoinSubqueriesPreprocessor::getRemoteDatabaseAndTableName(const IStorage & table) const
 {
-    const StorageDistributed & distributed = typeid_cast<const StorageDistributed &>(table);
+    const StorageDistributed & distributed = dynamic_cast<const StorageDistributed &>(table);
     return { distributed.getRemoteDatabaseName(), distributed.getRemoteTableName() };
 }
 

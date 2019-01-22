@@ -5,11 +5,9 @@ if (NOT USE_INTERNAL_SPARCEHASH_LIBRARY)
 endif ()
 
 if (SPARCEHASH_INCLUDE_DIR)
-    include_directories (${SPARCEHASH_INCLUDE_DIR})
 else ()
     set (USE_INTERNAL_SPARCEHASH_LIBRARY 1)
     set (SPARCEHASH_INCLUDE_DIR "${ClickHouse_SOURCE_DIR}/contrib/libsparsehash")
-    include_directories (BEFORE ${SPARCEHASH_INCLUDE_DIR})
 endif ()
 
 message (STATUS "Using sparsehash: ${SPARCEHASH_INCLUDE_DIR}")

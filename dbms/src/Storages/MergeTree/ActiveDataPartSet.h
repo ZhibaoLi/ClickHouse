@@ -1,8 +1,8 @@
 #pragma once
-#include <mutex>
-#include <common/DateLUT.h>
+
+#include <Storages/MergeTree/MergeTreePartInfo.h>
 #include <Core/Types.h>
-#include <set>
+#include <map>
 
 
 namespace DB
@@ -10,70 +10,69 @@ namespace DB
 
 /** Supports multiple names of active parts of data.
   * Repeats part of the MergeTreeData functionality.
-  * TODO: generalize with MergeTreeData. It is possible to leave this class approximately as is and use it from MergeTreeData.
-  *       Then in MergeTreeData you can make map<String, DataPartPtr> data_parts and all_data_parts.
+  * TODO: generalize with MergeTreeData
   */
 class ActiveDataPartSet
 {
 public:
-    ActiveDataPartSet() {}
-    ActiveDataPartSet(const Strings & names);
+    ActiveDataPartSet(MergeTreeDataFormatVersion format_version_) : format_version(format_version_) {}
+    ActiveDataPartSet(MergeTreeDataFormatVersion format_version_, const Strings & names);
 
-    struct Part
+    ActiveDataPartSet(const ActiveDataPartSet & other)
+        : format_version(other.format_version)
+        , part_info_to_name(other.part_info_to_name)
+    {}
+
+    ActiveDataPartSet(ActiveDataPartSet && other) noexcept { swap(other); }
+
+    void swap(ActiveDataPartSet & other) noexcept
     {
-        DayNum_t left_date;
-        DayNum_t right_date;
-        Int64 left;
-        Int64 right;
-        UInt32 level;
-        String name; /// pure name without prefixes
-        DayNum_t month;
+        std::swap(format_version, other.format_version);
+        std::swap(part_info_to_name, other.part_info_to_name);
+    }
 
-        bool operator<(const Part & rhs) const
+    ActiveDataPartSet & operator=(const ActiveDataPartSet & other)
+    {
+        if (&other != this)
         {
-            return std::tie(month, left, right, level) < std::tie(rhs.month, rhs.left, rhs.right, rhs.level);
+            ActiveDataPartSet tmp(other);
+            swap(tmp);
         }
+        return *this;
+    }
 
-        /// Contains another part (obtained after merging another part with some other)
-        bool contains(const Part & rhs) const
-        {
-            return month == rhs.month        /// Parts for different months are not merged
-                && left <= rhs.left
-                && right >= rhs.right
-                && level >= rhs.level;
-        }
-    };
+    /// Returns true if the part was actually added. If out_replaced_parts != nullptr, it will contain
+    /// parts that were replaced from the set by the newly added part.
+    bool add(const String & name, Strings * out_replaced_parts = nullptr);
 
-    void add(const String & name);
+    bool remove(const MergeTreePartInfo & part_info)
+    {
+        return part_info_to_name.erase(part_info) > 0;
+    }
 
-    /// If not found, returns an empty string.
+    bool remove(const String & part_name)
+    {
+        return remove(MergeTreePartInfo::fromPartName(part_name, format_version));
+    }
+
+    /// If not found, return an empty string.
+    String getContainingPart(const MergeTreePartInfo & part_info) const;
     String getContainingPart(const String & name) const;
 
-    Strings getParts() const; /// In ascending order of the month and block number.
+    Strings getPartsCoveredBy(const MergeTreePartInfo & part_info) const;
+
+    /// Returns parts in ascending order of the partition_id and block number.
+    Strings getParts() const;
 
     size_t size() const;
 
-    static String getPartName(DayNum_t left_date, DayNum_t right_date, Int64 left_id, Int64 right_id, UInt64 level);
-
-    /// Returns true if the directory name matches the format of the directory name of the parts
-    static bool isPartDirectory(const String & dir_name);
-
-    static bool parsePartNameImpl(const String & dir_name, Part * part);
-
-    /// Put data in DataPart from the name of the part.
-    static void parsePartName(const String & dir_name, Part & part);
-
-    static bool contains(const String & outer_part_name, const String & inner_part_name);
+    MergeTreeDataFormatVersion getFormatVersion() const { return format_version; }
 
 private:
-    using Parts = std::set<Part>;
+    MergeTreeDataFormatVersion format_version;
+    std::map<MergeTreePartInfo, String> part_info_to_name;
 
-    mutable std::mutex mutex;
-    Parts parts;
-
-    /// Do not block mutex.
-    void addImpl(const String & name);
-    String getContainingPartImpl(const String & name) const;
+    std::map<MergeTreePartInfo, String>::const_iterator getContainingPartImpl(const MergeTreePartInfo & part_info) const;
 };
 
 }

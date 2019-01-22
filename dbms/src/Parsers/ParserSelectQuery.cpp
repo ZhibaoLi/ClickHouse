@@ -1,6 +1,5 @@
 #include <memory>
 #include <Parsers/ASTSelectQuery.h>
-#include <Parsers/ASTIdentifier.h>
 #include <Parsers/IParserBase.h>
 #include <Parsers/CommonParsers.h>
 #include <Parsers/ExpressionElementParsers.h>
@@ -10,7 +9,6 @@
 #include <Parsers/ParserSelectQuery.h>
 #include <Parsers/ParserTablesInSelectQuery.h>
 
-#include <iostream>
 
 namespace DB
 {
@@ -18,17 +16,15 @@ namespace DB
 namespace ErrorCodes
 {
     extern const int SYNTAX_ERROR;
+    extern const int TOP_AND_LIMIT_TOGETHER;
 }
 
 
-bool ParserSelectQuery::parseImpl(Pos & pos, Pos end, ASTPtr & node, Pos & max_parsed_pos, Expected & expected)
+bool ParserSelectQuery::parseImpl(Pos & pos, ASTPtr & node, Expected & expected)
 {
-    Pos begin = pos;
-
     auto select_query = std::make_shared<ASTSelectQuery>();
     node = select_query;
 
-    ParserWhitespaceOrComments ws;
     ParserKeyword s_select("SELECT");
     ParserKeyword s_distinct("DISTINCT");
     ParserKeyword s_from("FROM");
@@ -42,195 +38,198 @@ bool ParserSelectQuery::parseImpl(Pos & pos, Pos end, ASTPtr & node, Pos & max_p
     ParserKeyword s_limit("LIMIT");
     ParserKeyword s_settings("SETTINGS");
     ParserKeyword s_by("BY");
+    ParserKeyword s_rollup("ROLLUP");
+    ParserKeyword s_cube("CUBE");
+    ParserKeyword s_top("TOP");
+    ParserKeyword s_offset("OFFSET");
 
     ParserNotEmptyExpressionList exp_list(false);
+    ParserNotEmptyExpressionList exp_list_for_with_clause(false, true); /// Set prefer_alias_to_column_name for each alias.
     ParserNotEmptyExpressionList exp_list_for_select_clause(true);    /// Allows aliases without AS keyword.
     ParserExpressionWithOptionalAlias exp_elem(false);
     ParserOrderByExpressionList order_list;
 
-    ws.ignore(pos, end);
+    ParserToken open_bracket(TokenType::OpeningRoundBracket);
+    ParserToken close_bracket(TokenType::ClosingRoundBracket);
+
+    /// WITH expr list
+    {
+        if (s_with.ignore(pos, expected))
+        {
+            if (!exp_list_for_with_clause.parse(pos, select_query->with_expression_list, expected))
+                return false;
+        }
+    }
 
     /// SELECT [DISTINCT] expr list
     {
-        if (!s_select.ignore(pos, end, max_parsed_pos, expected))
+        if (!s_select.ignore(pos, expected))
             return false;
 
-        ws.ignore(pos, end);
-
-        if (s_distinct.ignore(pos, end, max_parsed_pos, expected))
-        {
+        if (s_distinct.ignore(pos, expected))
             select_query->distinct = true;
-            ws.ignore(pos, end);
+
+        if (s_top.ignore(pos, expected))
+        {
+            ParserNumber num;
+
+            if (open_bracket.ignore(pos, expected))
+            {
+                if (!num.parse(pos, select_query->limit_length, expected))
+                    return false;
+                if (!close_bracket.ignore(pos, expected))
+                    return false;
+            }
+            else
+            {
+                if (!num.parse(pos, select_query->limit_length, expected))
+                    return false;
+            }
         }
 
-        if (!exp_list_for_select_clause.parse(pos, end, select_query->select_expression_list, max_parsed_pos, expected))
+        if (!exp_list_for_select_clause.parse(pos, select_query->select_expression_list, expected))
             return false;
-
-        ws.ignore(pos, end);
     }
 
-    /// FROM database.table or FROM table or FROM (subquery) or FROM tableFunction
-    if (s_from.ignore(pos, end, max_parsed_pos, expected))
+    /// FROM database.table or FROM table or FROM (subquery) or FROM tableFunction(...)
+    if (s_from.ignore(pos, expected))
     {
-        ws.ignore(pos, end);
-
-        if (!ParserTablesInSelectQuery().parse(pos, end, select_query->tables, max_parsed_pos, expected))
+        if (!ParserTablesInSelectQuery().parse(pos, select_query->tables, expected))
             return false;
-
-        ws.ignore(pos, end);
     }
 
     /// PREWHERE expr
-    if (s_prewhere.ignore(pos, end, max_parsed_pos, expected))
+    if (s_prewhere.ignore(pos, expected))
     {
-        ws.ignore(pos, end);
-
-        if (!exp_elem.parse(pos, end, select_query->prewhere_expression, max_parsed_pos, expected))
+        if (!exp_elem.parse(pos, select_query->prewhere_expression, expected))
             return false;
-
-        ws.ignore(pos, end);
     }
 
     /// WHERE expr
-    if (s_where.ignore(pos, end, max_parsed_pos, expected))
+    if (s_where.ignore(pos, expected))
     {
-        ws.ignore(pos, end);
-
-        if (!exp_elem.parse(pos, end, select_query->where_expression, max_parsed_pos, expected))
+        if (!exp_elem.parse(pos, select_query->where_expression, expected))
             return false;
-
-        ws.ignore(pos, end);
     }
 
     /// GROUP BY expr list
-    if (s_group_by.ignore(pos, end, max_parsed_pos, expected))
+    if (s_group_by.ignore(pos, expected))
     {
-        if (!exp_list.parse(pos, end, select_query->group_expression_list, max_parsed_pos, expected))
+        if (s_rollup.ignore(pos, expected))
+            select_query->group_by_with_rollup = true;
+        else if (s_cube.ignore(pos, expected))
+            select_query->group_by_with_cube = true;
+
+        if ((select_query->group_by_with_rollup || select_query->group_by_with_cube) && !open_bracket.ignore(pos, expected))
             return false;
 
-        ws.ignore(pos, end);
+        if (!exp_list.parse(pos, select_query->group_expression_list, expected))
+            return false;
+
+        if ((select_query->group_by_with_rollup || select_query->group_by_with_cube) && !close_bracket.ignore(pos, expected))
+            return false;
+    }
+
+    /// WITH ROLLUP, CUBE or TOTALS
+    if (s_with.ignore(pos, expected))
+    {
+        if (s_rollup.ignore(pos, expected))
+            select_query->group_by_with_rollup = true;
+        else if (s_cube.ignore(pos, expected))
+            select_query->group_by_with_cube = true;
+        else if (s_totals.ignore(pos, expected))
+            select_query->group_by_with_totals = true;
+        else
+            return false;
     }
 
     /// WITH TOTALS
-    if (s_with.ignore(pos, end, max_parsed_pos, expected))
+    if (s_with.ignore(pos, expected))
     {
-        ws.ignore(pos, end);
-        if (!s_totals.ignore(pos, end, max_parsed_pos, expected))
+        if (select_query->group_by_with_totals || !s_totals.ignore(pos, expected))
             return false;
 
         select_query->group_by_with_totals = true;
-
-        ws.ignore(pos, end);
     }
 
     /// HAVING expr
-    if (s_having.ignore(pos, end, max_parsed_pos, expected))
+    if (s_having.ignore(pos, expected))
     {
-        ws.ignore(pos, end);
-
-        if (!exp_elem.parse(pos, end, select_query->having_expression, max_parsed_pos, expected))
+        if (!exp_elem.parse(pos, select_query->having_expression, expected))
             return false;
-
-        ws.ignore(pos, end);
     }
 
     /// ORDER BY expr ASC|DESC COLLATE 'locale' list
-    if (s_order_by.ignore(pos, end, max_parsed_pos, expected))
+    if (s_order_by.ignore(pos, expected))
     {
-        if (!order_list.parse(pos, end, select_query->order_expression_list, max_parsed_pos, expected))
+        if (!order_list.parse(pos, select_query->order_expression_list, expected))
             return false;
-
-        ws.ignore(pos, end);
     }
 
     /// LIMIT length | LIMIT offset, length | LIMIT count BY expr-list
-    if (s_limit.ignore(pos, end, max_parsed_pos, expected))
+    if (s_limit.ignore(pos, expected))
     {
-        ws.ignore(pos, end);
+        if (select_query->limit_length)
+            throw Exception("Can not use TOP and LIMIT together", ErrorCodes::TOP_AND_LIMIT_TOGETHER);
 
-        ParserString s_comma(",");
+        ParserToken s_comma(TokenType::Comma);
         ParserNumber num;
 
-        if (!num.parse(pos, end, select_query->limit_length, max_parsed_pos, expected))
+        if (!num.parse(pos, select_query->limit_length, expected))
             return false;
 
-        ws.ignore(pos, end);
-
-        if (s_comma.ignore(pos, end, max_parsed_pos, expected))
+        if (s_comma.ignore(pos, expected))
         {
             select_query->limit_offset = select_query->limit_length;
-            if (!num.parse(pos, end, select_query->limit_length, max_parsed_pos, expected))
+            if (!num.parse(pos, select_query->limit_length, expected))
                 return false;
-
-            ws.ignore(pos, end);
         }
-        else if (s_by.ignore(pos, end, max_parsed_pos, expected))
+        else if (s_by.ignore(pos, expected))
         {
             select_query->limit_by_value = select_query->limit_length;
             select_query->limit_length = nullptr;
 
-            ws.ignore(pos, end);
-
-            if (!exp_list.parse(pos, end, select_query->limit_by_expression_list, max_parsed_pos, expected))
+            if (!exp_list.parse(pos, select_query->limit_by_expression_list, expected))
                 return false;
-
-            ws.ignore(pos, end);
+        }
+        else if (s_offset.ignore(pos, expected))
+        {
+            if (!num.parse(pos, select_query->limit_offset, expected))
+                return false;
         }
     }
 
     /// LIMIT length | LIMIT offset, length
-    if (s_limit.ignore(pos, end, max_parsed_pos, expected))
+    if (s_limit.ignore(pos, expected))
     {
         if (!select_query->limit_by_value || select_query->limit_length)
             return false;
 
-        ws.ignore(pos, end);
-
-        ParserString s_comma(",");
+        ParserToken s_comma(TokenType::Comma);
         ParserNumber num;
 
-        if (!num.parse(pos, end, select_query->limit_length, max_parsed_pos, expected))
+        if (!num.parse(pos, select_query->limit_length, expected))
             return false;
 
-        ws.ignore(pos, end);
-
-        if (s_comma.ignore(pos, end, max_parsed_pos, expected))
+        if (s_comma.ignore(pos, expected))
         {
             select_query->limit_offset = select_query->limit_length;
-            if (!num.parse(pos, end, select_query->limit_length, max_parsed_pos, expected))
+            if (!num.parse(pos, select_query->limit_length, expected))
                 return false;
-
-            ws.ignore(pos, end);
         }
     }
 
     /// SETTINGS key1 = value1, key2 = value2, ...
-    if (s_settings.ignore(pos, end, max_parsed_pos, expected))
+    if (s_settings.ignore(pos, expected))
     {
-        ws.ignore(pos, end);
-
         ParserSetQuery parser_settings(true);
 
-        if (!parser_settings.parse(pos, end, select_query->settings, max_parsed_pos, expected))
+        if (!parser_settings.parse(pos, select_query->settings, expected))
             return false;
-
-        ws.ignore(pos, end);
     }
 
-    // UNION ALL select query
-    if (ParserKeyword("UNION ALL").ignore(pos, end, max_parsed_pos, expected))
-    {
-        ParserSelectQuery select_p;
-        if (!select_p.parse(pos, end, select_query->next_union_all, max_parsed_pos, expected))
-            return false;
-        auto next_select_query = static_cast<ASTSelectQuery *>(&*select_query->next_union_all);
-        next_select_query->prev_union_all = node.get();
-
-        ws.ignore(pos, end);
-    }
-
-    select_query->range = StringRange(begin, pos);
-
+    if (select_query->with_expression_list)
+        select_query->children.push_back(select_query->with_expression_list);
     select_query->children.push_back(select_query->select_expression_list);
     if (select_query->tables)
         select_query->children.push_back(select_query->tables);
@@ -254,9 +253,6 @@ bool ParserSelectQuery::parseImpl(Pos & pos, Pos end, ASTPtr & node, Pos & max_p
         select_query->children.push_back(select_query->limit_length);
     if (select_query->settings)
         select_query->children.push_back(select_query->settings);
-
-    if (select_query->next_union_all)
-        select_query->children.push_back(select_query->next_union_all);
 
     return true;
 }

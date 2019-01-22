@@ -4,11 +4,12 @@
 
 #include <Poco/File.h>
 #include <Poco/Path.h>
-#include <Poco/RWLock.h>
 
 #include <common/logger_useful.h>
 
 #include <atomic>
+#include <shared_mutex>
+#include <ext/shared_ptr_helper.h>
 
 
 namespace DB
@@ -17,46 +18,9 @@ namespace DB
 class StorageFileBlockInputStream;
 class StorageFileBlockOutputStream;
 
-class StorageFile : public IStorage
+class StorageFile : public ext::shared_ptr_helper<StorageFile>, public IStorage
 {
 public:
-
-    /** there are three options (ordered by priority):
-        - use specified file descriptor if (fd >= 0)
-        - use specified table_path if it isn't empty
-        - create own tabale inside data/db/table/
-    */
-    StorageFile(
-        const std::string & table_path_,
-        int table_fd_,
-        const std::string & db_dir_path,
-        const std::string & table_name_,
-        const std::string & format_name_,
-        const NamesAndTypesListPtr & columns_,
-        const NamesAndTypesList & materialized_columns_,
-        const NamesAndTypesList & alias_columns_,
-        const ColumnDefaults & column_defaults_,
-        Context & context_);
-
-    static StoragePtr create(
-        const std::string & table_path,
-        int table_fd,
-        const std::string & db_dir_path,
-        const std::string & table_name,
-        const std::string & format_name,
-        const NamesAndTypesListPtr & columns,
-        const NamesAndTypesList & materialized_columns_,
-        const NamesAndTypesList & alias_columns_,
-        const ColumnDefaults & column_defaults_,
-        Context & context)
-    {
-        return std::make_shared<StorageFile>(
-            table_path, table_fd,
-            db_dir_path, table_name, format_name, columns,
-            materialized_columns_, alias_columns_, column_defaults_,
-            context);
-    }
-
     std::string getName() const override
     {
         return "File";
@@ -67,16 +31,11 @@ public:
         return table_name;
     }
 
-    const NamesAndTypesList & getColumnsListImpl() const override
-    {
-        return *columns;
-    }
-
     BlockInputStreams read(
         const Names & column_names,
-        const ASTPtr & query,
+        const SelectQueryInfo & query_info,
         const Context & context,
-        QueryProcessingStage::Enum & processed_stage,
+        QueryProcessingStage::Enum processed_stage,
         size_t max_block_size,
         unsigned num_streams) override;
 
@@ -88,16 +47,30 @@ public:
 
     void rename(const String & new_path_to_db, const String & new_database_name, const String & new_table_name) override;
 
-protected:
+    String getDataPath() const override { return path; }
 
+protected:
     friend class StorageFileBlockInputStream;
     friend class StorageFileBlockOutputStream;
+
+    /** there are three options (ordered by priority):
+    - use specified file descriptor if (fd >= 0)
+    - use specified table_path if it isn't empty
+    - create own table inside data/db/table/
+    */
+    StorageFile(
+        const std::string & table_path_,
+        int table_fd_,
+        const std::string & db_dir_path,
+        const std::string & table_name_,
+        const std::string & format_name_,
+        const ColumnsDescription & columns_,
+        Context & context_);
 
 private:
 
     std::string table_name;
     std::string format_name;
-    NamesAndTypesListPtr columns;
     Context & context_global;
 
     std::string path;
@@ -108,7 +81,7 @@ private:
     std::atomic<bool> table_fd_was_used{false}; /// To detect repeating reads from stdin
     off_t table_fd_init_offset = -1;            /// Initial position of fd, used for repeating reads
 
-    mutable Poco::RWLock rwlock;
+    mutable std::shared_mutex rwlock;
 
     Logger * log = &Logger::get("StorageFile");
 };
